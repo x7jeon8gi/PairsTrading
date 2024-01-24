@@ -1,0 +1,33 @@
+data: 'characteristics_us'
+data_refine: None # 'res/predictions/20_characteristics_us' # ! 학습이 끊겼을시 재실행 / 평소에는 None 줄 것!
+#data_filter_year : 1990
+
+# 아래 파라미터는 클러스터 6개 기준의 best_params로 설정되었음. (OPTUNA hyper parameter tuning)
+model:
+  n_bins: 64 # ! bins
+  augment_std: 0.1
+  cluster_num: 50 # todo 가장 중요한 CLUSTER NUMBER
+  # dim_in_out: 64
+  num_features: 128 # column의 길이
+  hidden_dim: 128 # ! hiddens
+  depth: 6
+  heads: 6
+  attn_dim_head: 32
+  pre_norm: True
+  use_simple_rmsnorm: True
+
+# 오직 100 epochs 훈련은 부족할 수 있음
+train:
+  model_saving_strategy: "better"
+  saving_path: 'res'
+  seed: 0
+  num_workers: 4
+  pin_memory: True
+  device: "cuda" 
+  epochs: 100
+  batch_size: 64 # todo Batch 32 / (64 or 128)
+  reload: None
+  lr: 0.0003
+  warmup_steps: 0
+  use_accelerator: False
+  use_wandb: False
