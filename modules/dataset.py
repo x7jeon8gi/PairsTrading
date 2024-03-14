@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import os
 from sklearn.preprocessing import StandardScaler
+import copy
 
 class Embedding_dataset(Dataset):
     def __init__(self, config, data=None, is_train=True):
@@ -35,21 +36,16 @@ class Embedding_dataset(Dataset):
         else:
             self.X = self.data
 
-        #! 'mom1' 열이 있으면 제거
-        if 'mom1' in self.data.columns:
-            # self.Y = self.data['mom1'].values
-            self.X = self.X.drop(columns=['mom1'])
-        else:
-            pass
-
         self.num_features = self.X.shape[1]
         
         self.X = self._normalize(self.X)
         self.feature_n_bins = [config['model']['n_bins']] * self.num_features # todo: bin config
         self._prepare_embedding(self.X)
         self.augment_std = config['model']['augment_std']
-        
-        self.preprocessed_data = self._prepare_data(self.X)
+        self.masking_ratio = config['model']['masking_ratio']
+
+        # * (*, num_features) -> (*, num_features, n_bins)
+        self.preprocessed_data = self._prepare_data(self.X, cls_init=config['model']['cls_init'])
 
     def __len__(self):
         return len(self.data)
@@ -65,7 +61,7 @@ class Embedding_dataset(Dataset):
             quantiles = np.linspace(0.0, 1.0, self.feature_n_bins[feature_idx] + 1)
             self.bin_edges.append(np.unique(np.quantile(self.X[:, feature_idx], quantiles))) 
 
-    def _apply_ple(self, X, add_cls=True):
+    def _apply_ple(self, X, add_cls=True, cls_init='random'):
         """
         On Embeddings for Numerical Features in Tabular Deep Learning(https://arxiv.org/pdf/2203.05556.pdf)
         위 논문의 컨셉을 유지하되, 완벽하게 동일한 구현은 아니며 많은 부분 생략되어 있음
@@ -78,9 +74,15 @@ class Embedding_dataset(Dataset):
         
         if add_cls:
             # Initialize CLS token with random values or ones.
-            # embedded[:, 0, :] = np.random.normal(0, 1, (N, max(self.feature_n_bins)))  # Random initialization
-            embedded[:, 0, :] = np.ones((N, max(self.feature_n_bins)))  # Zero initialization
-        
+            if cls_init == 'random':
+                embedded[:, 0, :] = np.random.normal(0, 1, (N, max(self.feature_n_bins)))
+            elif cls_init == 'ones':
+                embedded[:, 0, :] = np.ones((N, max(self.feature_n_bins)))  # One initialization
+            # elif cls_init == 'means':
+            #     embedded[:, 0, :] 
+            else:
+                raise ValueError('Invalid cls_init')
+            
         for feature_idx in range(M):
             bins = np.digitize(X[:, feature_idx], np.r_[-np.inf, self.bin_edges[feature_idx][1:-1], np.inf]) - 1
             if bins.shape ==(1,):
@@ -107,17 +109,21 @@ class Embedding_dataset(Dataset):
             std = self.augment_std
         return X + np.random.normal(0, std, X.shape)
     
-    def _augment_with_random_masking(self, X, mask=0.1):
+    def _augment_with_random_masking(self, X):
         """
         Random masking augmentation
         일부 Columm을 랜덤하게 0으로 만들어줌 
         """
+        if self.masking_ratio is None:
+            masking_ratio = 0.10
+        else:
+            masking_ratio = self.masking_ratio
         N, M = X.shape
-        mask = np.random.binomial(1, 1- mask, (N, M))
+        mask = np.random.binomial(1, 1- masking_ratio, (N, M))
         X = X * mask
         return X
     
-    def _prepare_data(self, X):
+    def _prepare_data(self, X, Y=None, cls_init='random'):
         preprocessed_data = []
 
         for i in range(X.shape[0]):
@@ -125,12 +131,13 @@ class Embedding_dataset(Dataset):
 
             if self.is_train:
                 x_aug1 = self._augment_with_gaussian_noise(x)
-                x_aug2 = self._augment_with_random_masking(x)
-                x_1 = self._apply_ple(x_aug1, add_cls=True)
-                x_2 = self._apply_ple(x_aug2, add_cls=True)
+                # x_aug2 = self._augment_with_random_masking(x) : random masking은 성능을 degrading 시킬 수 있음.
+                x_aug2 = copy.deepcopy(x)
+                x_1 = self._apply_ple(x_aug1, add_cls=True, cls_init=cls_init)
+                x_2 = self._apply_ple(x_aug2, add_cls=True, cls_init=cls_init)
             else:
-                x_1 = self._apply_ple(x, add_cls=True)
-                x_2 = self._apply_ple(x, add_cls=True)
+                x_1 = self._apply_ple(x, add_cls=True, cls_init=cls_init)
+                x_2 = self._apply_ple(x, add_cls=True, cls_init=cls_init)
 
             preprocessed_data.append((x_1, x_2))
             

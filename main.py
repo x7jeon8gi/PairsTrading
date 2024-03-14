@@ -27,6 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from functools import partial
 import torch.multiprocessing as mp
 from datetime import datetime
+import yaml
 import logging
 
 class Get_Data():
@@ -69,14 +70,6 @@ class ModelTrainer:
         train_data = train_data_frame.iloc[:, 1:]
         # Load data
         train_data = Embedding_dataset(self.config, data=train_data)
-        
-        # the batch size depends on length of train_data
-        # if len(train_data) < 1000:
-        #     self.batch_size = 64
-        # elif len(train_data) < 3000:
-        #     self.batch_size = 128
-        # elif len(train_data) < 50000:
-        #     self.batch_size = 256
 
         train_loader = DataLoader(train_data, 
                                 batch_size=self.batch_size, 
@@ -101,7 +94,6 @@ class ModelTrainer:
                         hidden_dim = self.config['model']['hidden_dim'],
                         depth = self.config['model']['depth'],
                         heads = self.config['model']['heads'],
-                        attn_dim_head = self.config['model']['attn_dim_head'],
                         pre_norm = self.config['model']['pre_norm'],
                         use_simple_rmsnorm = self.config['model']['use_simple_rmsnorm']
         )
@@ -196,10 +188,7 @@ class ModelTrainer:
 
         # No outlier
         clusters = clusters + 1
-        predictions = pd.DataFrame()
-        predictions['firms'] = test_data_frame['firms']
-        predictions['clusters'] = clusters
-        predictions['mom1'] = test_data_frame['mom1']
+        predictions = pd.DataFrame({'firms': test_data_frame['firms'], 'clusters': clusters, 'mom1': test_data_frame['mom1']})
 
         ##! save
         if not os.path.exists(f"{self.saving_path}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
@@ -215,8 +204,7 @@ class ModelTrainer:
             os.makedirs(f"{self.saving_path}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
         prob_df.to_csv(f"{self.saving_path}/prob/{self.config['model']['cluster_num']}_{file_path}", index=False)
 
-
-# # ! Multi GPU
+# ! Multi GPU
 def setup(rank):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)
     torch.cuda.set_device(rank)
@@ -259,8 +247,10 @@ def main(config):
         time_taken = (end_time - start_time).total_seconds()
         progress_bar.set_postfix(batch_time=f"{time_taken:.2f}s")
         progress_bar.update(1)
+        
 #############################################################################
-# # ! Single GPU
+# ! Single GPU
+
 # def main(config):
 #     csv_loader = Get_Data(config['data'], config['data_refine'])
 #     file_list = csv_loader.get_file_list()
@@ -274,4 +264,11 @@ if __name__ == "__main__":
     args = load_args()
     config = load_yaml_param_settings(args.config)
     
+    # Save the configuration
+    if not os.path.exists(config['train']['saving_path']):
+        os.makedirs(config['train']['saving_path'])
+    date = datetime.now().strftime("%Y%m%d-%H%M")
+    with open(f"{config['train']['saving_path']}/run_{date}_config.yaml", 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+
     main(config)

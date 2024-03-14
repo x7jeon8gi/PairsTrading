@@ -12,38 +12,50 @@ class Network(nn.Module):
     projectors는 각각 instance projector와 cluster projector로 구성
     projector 구성에 따라 모델의 성능이 달라질 수 있음
     """
-    def __init__(self, cluster_num, dim_in_out, num_features, hidden_dim, depth, heads, attn_dim_head, pre_norm=False, use_simple_rmsnorm=True):
-        super(Network, self).__init__()
-        self.transformer = ContinuousTransformerWrapper(
-            dim_in = dim_in_out,
-            dim_out = dim_in_out,
-            max_seq_len = num_features + 1,
-            emb_dropout = 0.1,
-            attn_layers = Encoder(
-                dim= hidden_dim,
-                depth = depth,
-                attn_dim_head = attn_dim_head,
-                attn_dropout = 0.1,
-                ff_dropout = 0.1,
-                pre_norm = False,
-                use_simple_rmsnorm = True
-            )
-        )
+    def __init__(self, 
+                 cluster_num, 
+                 dim_in_out,
+                 num_features, 
+                 hidden_dim, 
+                 depth, heads, 
+                 pre_norm, 
+                 use_simple_rmsnorm):
         
+        super(Network, self).__init__()
+
         self.hidden_dim = hidden_dim
         self.dim = dim_in_out
         self.cluster_num = cluster_num
-        self.emb_linear = nn.Linear(self.dim, self.dim)
-        
+
+        self.emb_linear = nn.Linear(self.dim, self.hidden_dim)
+        self.emb_activation = nn.GELU()
+
+        self.transformer = ContinuousTransformerWrapper(
+            dim_in = hidden_dim,
+            dim_out = hidden_dim,
+            max_seq_len = num_features + 1,
+            emb_dropout = 0.1,
+            
+            attn_layers = Encoder(
+                dim= hidden_dim,
+                depth = depth,
+                heads = heads,
+                attn_dropout = 0.1,
+                ff_dropout = 0.1,
+                pre_norm = pre_norm,
+                use_simple_rmsnorm = use_simple_rmsnorm
+            )
+        )
+
         self.instance_projector = nn.Sequential(
-            nn.Linear(self.dim, hidden_dim),
+            nn.Linear(self.hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, self.dim),
         )
         self.cluster_projector = nn.Sequential(
             # nn.BatchNorm1d(hidden_dim), # If use small batch size, It could be worse
-            nn.Linear(self.dim, hidden_dim),
+            nn.Linear(self.hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, self.cluster_num),
@@ -55,6 +67,9 @@ class Network(nn.Module):
         x_i = self.emb_linear(x_i)
         x_j = self.emb_linear(x_j)
         
+        x_i = self.emb_activation(x_i)
+        x_j = self.emb_activation(x_j)
+
         h_i = self.transformer(x_i) # Batch, seq_len, dim
         h_j = self.transformer(x_j)
         
