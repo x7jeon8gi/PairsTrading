@@ -170,7 +170,7 @@ class ModelTrainer:
         if self.config['train']['use_wandb']:
             accelerator.end_training()
 
-    def cluster_inference(self, file_path):
+    def cluster_inference(self, file_path, config):
          #* 동일한 데이터를 사용한다.
         test_data_frame = pd.read_csv(file_path)
         test_data = test_data_frame.iloc[:, 1:]
@@ -190,19 +190,23 @@ class ModelTrainer:
         clusters = clusters + 1
         predictions = pd.DataFrame({'firms': test_data_frame['firms'], 'clusters': clusters, 'mom1': test_data_frame['mom1']})
 
+        batch = config['train']['batch_size']
+        n_bins = config['model']['n_bins']
+        hidden_dim = config['model']['hidden_dim']
+
         ##! save
-        if not os.path.exists(f"{self.saving_path}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
-            os.makedirs(f"{self.saving_path}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
+        if not os.path.exists(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
+            os.makedirs(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
         # print(self.config['model']['cluster_num'], file_path)
-        predictions.to_csv(f"{self.saving_path}/predictions/{self.config['model']['cluster_num']}_{file_path}", index=False)
+        predictions.to_csv(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/predictions/{self.config['model']['cluster_num']}_{file_path}", index=False)
 
         #* probability saving
         prob_df = pd.DataFrame(prob, columns=[f'prob_{i}' for i in range(self.config['model']['cluster_num'])])
         prob_df['firms'] = test_data_frame['firms']
 
-        if not os.path.exists(f"{self.saving_path}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
-            os.makedirs(f"{self.saving_path}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
-        prob_df.to_csv(f"{self.saving_path}/prob/{self.config['model']['cluster_num']}_{file_path}", index=False)
+        if not os.path.exists(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
+            os.makedirs(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
+        prob_df.to_csv(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/prob/{self.config['model']['cluster_num']}_{file_path}", index=False)
 
 # ! Multi GPU
 def setup(rank):
@@ -216,7 +220,7 @@ def process_file(rank, file_path, config):
 
     trainer = ModelTrainer(config)
     trainer.train(file_path)
-    trainer.cluster_inference(file_path)
+    trainer.cluster_inference(file_path, config)
 
 def main(config):
     set_start_method('spawn', force=True)
@@ -249,7 +253,7 @@ def main(config):
         progress_bar.update(1)
         
 #############################################################################
-# ! Single GPU
+# ## ! Single GPU
 
 # def main(config):
 #     csv_loader = Get_Data(config['data'], config['data_refine'])
@@ -268,7 +272,7 @@ if __name__ == "__main__":
     if not os.path.exists(config['train']['saving_path']):
         os.makedirs(config['train']['saving_path'])
     date = datetime.now().strftime("%Y%m%d-%H%M")
-    with open(f"{config['train']['saving_path']}/run_{date}_config.yaml", 'w') as f:
+    with open(f"{config['train']['saving_path']}/configs/run_{date}_config.yaml", 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
 
     main(config)

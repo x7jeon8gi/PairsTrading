@@ -131,8 +131,8 @@ class Embedding_dataset(Dataset):
 
             if self.is_train:
                 x_aug1 = self._augment_with_gaussian_noise(x)
-                # x_aug2 = self._augment_with_random_masking(x) : random masking은 성능을 degrading 시킬 수 있음.
-                x_aug2 = copy.deepcopy(x)
+                x_aug2 = self._augment_with_random_masking(x) #: random masking은 성능을 degrading 시킬 수 있음.
+                # x_aug2 = copy.deepcopy(x)
                 x_1 = self._apply_ple(x_aug1, add_cls=True, cls_init=cls_init)
                 x_2 = self._apply_ple(x_aug2, add_cls=True, cls_init=cls_init)
             else:
