@@ -23,12 +23,15 @@ def train_epoch(
 ):
     model.train()
     loss_epoch = 0
-    
     for batch_idx, (x_w, x_s) in enumerate(data_loader):
+
         training_step += 1
         optimizer.zero_grad()
-        x_w = x_w.to(device)
-        x_s = x_s.to(device)
+
+        if not use_accelerator:
+            x_w = x_w.to(device)
+            x_s = x_s.to(device)
+            
         z_i, z_j, c_i, c_j = model(x_w, x_s)
         loss_instance = criterion_ins(torch.concat((z_i, z_j),dim=0))
         loss_cluster = criterion_clu(torch.concat((c_i, c_j), dim=0))

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import os
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import copy
 
 class Embedding_dataset(Dataset):
@@ -50,9 +50,15 @@ class Embedding_dataset(Dataset):
     def __len__(self):
         return len(self.data)
     
-    def _normalize(self, X):
-        scaler = StandardScaler()
-        return scaler.fit_transform(X)
+    def _normalize(self, X, type='standard'):
+        if type == 'standard':
+            scaler = StandardScaler()
+            return scaler.fit_transform(X)
+        elif type == 'minmax':
+            scaler = MinMaxScaler()
+            return scaler.fit_transform(X)
+        else:
+            raise ValueError('Invalid normalization type')
 
     def _prepare_embedding(self, X):
         # self.feature_n_bins = [64] * self.num_features # todo: bin config
@@ -68,21 +74,66 @@ class Embedding_dataset(Dataset):
         그러나 Piecewise linear encoding을 통한 embedding의 개념 자체는 동일
         Unsupervised 특성 상 Decision Tree를 통한 binning을 사용하지 않고, quantile을 통한 binning을 사용
         """
-        N, M = X.shape
-        cls_dim = 1 if add_cls else 0
-        embedded = np.zeros((N, M + cls_dim, max(self.feature_n_bins)))
+
+        # # Pytorch로 구현
+        # N, M = X.shape
+        # cls_dim = 1 if add_cls else 0
+        # # PyTorch 텐서로 `embedded` 초기화
+        # embedded = torch.zeros(N, M + cls_dim, max(self.feature_n_bins))
         
-        if add_cls:
-            # Initialize CLS token with random values or ones.
-            if cls_init == 'random':
-                embedded[:, 0, :] = np.random.normal(0, 1, (N, max(self.feature_n_bins)))
-            elif cls_init == 'ones':
-                embedded[:, 0, :] = np.ones((N, max(self.feature_n_bins)))  # One initialization
-            # elif cls_init == 'means':
-            #     embedded[:, 0, :] 
-            else:
-                raise ValueError('Invalid cls_init')
+        # if add_cls:
+        #     # Initialize CLS token with random values, ones, or as a trainable parameter
+        #     if cls_init == 'random':
+        #         cls_values = torch.randn(N, 1, max(self.feature_n_bins))
+        #     elif cls_init == 'ones':
+        #         cls_values = torch.ones(N, 1, max(self.feature_n_bins))
+        #     elif cls_init == 'learnable':
+        #         # 학습 가능한 CLS 토큰 생성
+        #         self.cls_token = nn.Parameter(torch.randn(1, max(self.feature_n_bins)))
+        #         cls_values = self.cls_token.expand(N, -1).unsqueeze(1)
+        #     else:
+        #         raise ValueError('Invalid cls_init')
+
+        #     embedded[:, 0, :] = cls_values.squeeze()
+
+        # for feature_idx in range(1,M):
+        #     # Binning using PyTorch operations, assuming `self.bin_edges` is a PyTorch tensor
+        #     bin_edges_tensor = torch.cat([
+        #         torch.tensor([-np.inf], dtype=torch.float32),
+        #         torch.tensor(self.bin_edges[feature_idx], dtype=torch.float32)[1:-1],
+        #         torch.tensor([np.inf], dtype=torch.float32)
+        #     ])
+
+        #     bins = torch.bucketize(X[:, feature_idx], bin_edges_tensor, right=True) - 1
+        #     bin_mask = torch.nn.functional.one_hot(bins, num_classes=self.feature_n_bins[feature_idx]).float()
+        #     x = bin_mask * bin_edges_tensor[1:][bins].unsqueeze(1)
+
+        #     previous_bins_mask = torch.arange(self.feature_n_bins[feature_idx]).unsqueeze(0) < bins.unsqueeze(1)
+        #     x[previous_bins_mask] = 1.0
+        #     embedded[:, feature_idx + cls_dim, :self.feature_n_bins[feature_idx]] = x
+                    
+        # if N == 1:
+        #     embedded = embedded.squeeze(0)
             
+        # return embedded
+
+        N, M = X.shape
+
+        # cls_dim = 1 if add_cls else 0
+        # embedded = np.zeros((N, M + cls_dim, max(self.feature_n_bins)))
+    
+        # if add_cls:
+        #     # Initialize CLS token with random values or ones.
+        #     if cls_init == 'random':
+        #         embedded[:, 0, :] = np.random.normal(0, 1, (N, max(self.feature_n_bins)))
+        #     elif cls_init == 'ones':
+        #         embedded[:, 0, :] = np.ones((N, max(self.feature_n_bins)))  # One initialization
+        #     else:
+        #         raise ValueError('Invalid cls_init')
+        
+        cls_dim = 0
+        embedded = np.zeros((N, M +cls_dim, max(self.feature_n_bins))) # ! ?
+
         for feature_idx in range(M):
             bins = np.digitize(X[:, feature_idx], np.r_[-np.inf, self.bin_edges[feature_idx][1:-1], np.inf]) - 1
             if bins.shape ==(1,):
@@ -145,32 +196,7 @@ class Embedding_dataset(Dataset):
     
     def __getitem__(self, idx):
         # 사전 처리된 데이터 반환
-        return [torch.FloatTensor(data) for data in self.preprocessed_data[idx]]
-
-    # def __getitem__(self, idx):
-    #     X = self.X[idx].reshape(-1, self.num_features)
-
-    #     if self.is_train:
-    #         # 2 different Augmentations
-    #         X_aug1 = self._augment_with_gaussian_noise(X)
-    #         X_aug2 = self._augment_with_random_masking(X)
-
-    #         # Apply PLE
-    #         X_1 = self._apply_ple(X_aug1, add_cls=True)
-    #         X_2 = self._apply_ple(X_aug2, add_cls=True)
-    #         # y= self.Y[idx]
-
-    #     else:
-    #         # No Augmentations during inference
-    #         X_1 = self._apply_ple(X, add_cls=True)
-    #         X_2 = self._apply_ple(X, add_cls=True)
-    #         # y= self.Y[idx]
-
-    #     return torch.FloatTensor(X_1), torch.FloatTensor(X_2), # torch.FloatTensor(y)
-
-    # def __getitem__(self, idx):
-    #     # Retrieve pre-processed data
-    #     X = self.X[idx]
-    #     X_aug = self.X_aug[idx]
-    #     # y = self.Y[idx]  # Uncomment if you have labels
-    #     return torch.FloatTensor(X), torch.FloatTensor(X_aug)  #, y
+        data = self.preprocessed_data[idx]
+        x_w = torch.FloatTensor(data[0])  
+        x_s = torch.FloatTensor(data[1])
+        return x_w, x_s

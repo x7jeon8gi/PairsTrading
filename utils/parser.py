@@ -14,6 +14,10 @@ def load_args():
     parser = ArgumentParser()
     parser.add_argument('--config', type=str, help="Path to the config data  file.",
                         default=get_root_dir().joinpath('configs', 'config.yaml'))
+    parser.add_argument('--cluster_num', type=int,  help='Number of clusters')
+    parser.add_argument('--batch_size', type=int, help='Batch size')
+    parser.add_argument('--overwrite', default=False, action='store_true' ,help='Overwrite the existing model')
+
     return parser.parse_args()
 
 

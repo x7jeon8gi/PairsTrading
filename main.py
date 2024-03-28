@@ -16,6 +16,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from torch.optim import Adam, AdamW
 from utils.parser import load_args, load_yaml_param_settings
+from utils.logger import get_logger
 import wandb
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers.optimization import get_linear_schedule_with_warmup
@@ -28,7 +29,9 @@ from functools import partial
 import torch.multiprocessing as mp
 from datetime import datetime
 import yaml
+import sys
 import logging
+import argparse
 
 class Get_Data():
     def __init__(self, directory, save_path=None):
@@ -59,6 +62,7 @@ class ModelTrainer:
         self.epochs = self.config['train']['epochs']
         self.use_accelerator = self.config['train']['use_accelerator']
         self.pin_memory = self.config['train']['pin_memory']
+        self.persist_workers = self.config['train']['persist_workers']
         # Seed everything
         seed_everything(self.seed)
 
@@ -77,7 +81,7 @@ class ModelTrainer:
                                 num_workers=self.num_workers, 
                                 drop_last=True, 
                                 pin_memory= self.pin_memory,
-                                persistent_workers=True) #! persistent_workers=True: worker를 메모리에 유지
+                                persistent_workers=self.persist_workers) #! persistent_workers=True: worker를 메모리에 유지
         
 
         return train_loader
@@ -95,7 +99,9 @@ class ModelTrainer:
                         depth = self.config['model']['depth'],
                         heads = self.config['model']['heads'],
                         pre_norm = self.config['model']['pre_norm'],
-                        use_simple_rmsnorm = self.config['model']['use_simple_rmsnorm']
+                        use_simple_rmsnorm = self.config['model']['use_simple_rmsnorm'],
+                        cls_init=self.config['model']['cls_init'],
+                        dropout_mask = self.config['model']['dropout_mask']
         )
         optimizer = AdamW(model.parameters(), lr = self.lr)
         num_training_steps = self.epochs * len(train_loader)  # 전체 학습에 걸쳐서 수행되는 step 수
@@ -178,7 +184,7 @@ class ModelTrainer:
         test_loader = DataLoader(test_data, 
                                  batch_size=self.batch_size, 
                                  shuffle=False, # Inference에서는 shuffle을 False로 설정해야 함
-                                 num_workers=self.num_workers, 
+                                 num_workers=self.num_workers,
                                  drop_last= False, # Inference에서는 drop_last를 False로 설정해야 함
                                  pin_memory=self.pin_memory)
         
@@ -193,20 +199,22 @@ class ModelTrainer:
         batch = config['train']['batch_size']
         n_bins = config['model']['n_bins']
         hidden_dim = config['model']['hidden_dim']
+        std = config['model']['augment_std']
+        mask = config['model']['masking_ratio']
 
         ##! save
-        if not os.path.exists(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
-            os.makedirs(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
+        if not os.path.exists(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
+            os.makedirs(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}/predictions/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
         # print(self.config['model']['cluster_num'], file_path)
-        predictions.to_csv(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/predictions/{self.config['model']['cluster_num']}_{file_path}", index=False)
+        predictions.to_csv(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}/predictions/{self.config['model']['cluster_num']}_{file_path}", index=False)
 
         #* probability saving
         prob_df = pd.DataFrame(prob, columns=[f'prob_{i}' for i in range(self.config['model']['cluster_num'])])
         prob_df['firms'] = test_data_frame['firms']
 
-        if not os.path.exists(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
-            os.makedirs(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
-        prob_df.to_csv(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}/prob/{self.config['model']['cluster_num']}_{file_path}", index=False)
+        if not os.path.exists(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}"):
+            os.makedirs(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}/prob/{self.config['model']['cluster_num']}_{file_path.split('/')[0]}")
+        prob_df.to_csv(f"{self.saving_path}/batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}/prob/{self.config['model']['cluster_num']}_{file_path}", index=False)
 
 # ! Multi GPU
 def setup(rank):
@@ -252,27 +260,39 @@ def main(config):
         progress_bar.set_postfix(batch_time=f"{time_taken:.2f}s")
         progress_bar.update(1)
         
-#############################################################################
-# ## ! Single GPU
-
-# def main(config):
-#     csv_loader = Get_Data(config['data'], config['data_refine'])
-#     file_list = csv_loader.get_file_list()
-#     for file in file_list:
-#         trainer = ModelTrainer(config)
-#         trainer.train(file)
-#         trainer.cluster_inference(file)
+# ! Single GPU
+def main_single(config):
+    csv_loader = Get_Data(config['data'], config['data_refine'])
+    file_list = csv_loader.get_file_list()
+    for file in file_list:
+        trainer = ModelTrainer(config)
+        trainer.train(file)
+        trainer.cluster_inference(file, config)
 
 if __name__ == "__main__":
 
+    logger = get_logger(__name__)
     args = load_args()
     config = load_yaml_param_settings(args.config)
     
+    if args.overwrite:
+        config['model']['cluster_num'] = args.cluster_num
+        config['train']['batch_size'] = args.batch_size
+        logger.info("Overwrite the existing configuration")
+
+    logger.info(f"\n Number of Cluster: {config['model']['cluster_num']}, Batch size: {config['train']['batch_size']}, Data_refine path: {config['data_refine']},\
+            \n n_bins: {config['model']['n_bins']}, hidden_dim: {config['model']['hidden_dim']}, masking_ratio: {config['model']['masking_ratio']}, augment_std: {config['model']['augment_std']}")
+
     # Save the configuration
     if not os.path.exists(config['train']['saving_path']):
         os.makedirs(config['train']['saving_path'])
     date = datetime.now().strftime("%Y%m%d-%H%M")
-    with open(f"{config['train']['saving_path']}/configs/run_{date}_config.yaml", 'w') as f:
+    with open(f"{config['train']['saving_path']}/RunConfigs/run_{date}_config.yaml", 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
 
-    main(config)
+    if config['gpu'] == 'multi':
+        main(config)
+    elif config['gpu'] == 'single':
+        main_single(config)
+    else:
+        logger.error("Please specify the number of GPUs to use: 'single' or 'multi'")

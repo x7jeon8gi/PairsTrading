@@ -19,14 +19,23 @@ class Network(nn.Module):
                  hidden_dim, 
                  depth, heads, 
                  pre_norm, 
-                 use_simple_rmsnorm):
+                 use_simple_rmsnorm,
+                 cls_init='ones',
+                 dropout_mask=0.1):
         
         super(Network, self).__init__()
 
         self.hidden_dim = hidden_dim
         self.dim = dim_in_out
         self.cluster_num = cluster_num
+        self.dropout_mask = dropout_mask
 
+        if cls_init == 'ones':
+            self.cls_token = nn.Parameter(torch.ones(1, self.dim))
+        elif cls_init == 'random':
+            self.cls_token = nn.Parameter(torch.randn(1, self.dim))
+        else:
+            raise ValueError('Invalid cls_init')
         self.emb_linear = nn.Linear(self.dim, self.hidden_dim)
         self.emb_activation = nn.GELU()
 
@@ -34,14 +43,14 @@ class Network(nn.Module):
             dim_in = hidden_dim,
             dim_out = hidden_dim,
             max_seq_len = num_features + 1,
-            emb_dropout = 0.1,
+            emb_dropout = self.dropout_mask,
             
             attn_layers = Encoder(
                 dim= hidden_dim,
                 depth = depth,
                 heads = heads,
-                attn_dropout = 0.1,
-                ff_dropout = 0.1,
+                attn_dropout = self.dropout_mask,
+                ff_dropout = self.dropout_mask,
                 pre_norm = pre_norm,
                 use_simple_rmsnorm = use_simple_rmsnorm
             )
@@ -50,20 +59,24 @@ class Network(nn.Module):
         self.instance_projector = nn.Sequential(
             nn.Linear(self.hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(self.dropout_mask),
             nn.Linear(hidden_dim, self.dim),
         )
         self.cluster_projector = nn.Sequential(
             # nn.BatchNorm1d(hidden_dim), # If use small batch size, It could be worse
             nn.Linear(self.hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(self.dropout_mask),
             nn.Linear(hidden_dim, self.cluster_num),
             nn.Softmax(dim=1)
         )
         
     def forward(self, x_i, x_j, return_ci=True):
         
+        cls_tokens = self.cls_token.expand(x_i.size(0), -1).unsqueeze(1)
+        x_i = torch.cat((cls_tokens, x_i), dim=1)
+        x_j = torch.cat((cls_tokens, x_j), dim=1)
+
         x_i = self.emb_linear(x_i)
         x_j = self.emb_linear(x_j)
         
