@@ -23,9 +23,8 @@ class InstanceLoss(nn.Module):
         n = z.shape[0] # batch size
         assert n % self.multiplier ==0
         
-        z = z / np.sqrt(self.tau)
-        
         logits = z @ z.t()
+        logits /= self.tau # apply temperature scaling
         logits[np.arange(n), np.arange(n)] =- self.LARGE_NUMBER # diagonal
         
         logprob = F.log_softmax(logits, dim=1)
@@ -43,7 +42,7 @@ class InstanceLoss(nn.Module):
 class ClusterLoss(torch.nn.Module):
     LARGE_NUMBER = 1e4
 
-    def __init__(self, tau=1.0, multiplier=2):
+    def __init__(self, tau=1.0, multiplier=2): # may tau should be 0.1 for better performance
         super().__init__()
         self.tau = tau
         self.multiplier = multiplier
@@ -58,9 +57,10 @@ class ClusterLoss(torch.nn.Module):
         c_i = c[:half_n]
         c_j = c[half_n:]
 
-        # c = F.normalize(c, p=2, dim=1) / np.sqrt(self.tau)
+        # todo: erase-> c = F.normalize(c, p=2, dim=1) / np.sqrt(self.tau)
         # --- Start: Contrastive Loss Calculation ---
-        logits = c @ c.t() / self.tau # apply temperature scaling
+        logits = c @ c.t() 
+        logits /= self.tau # apply temperature scaling
         logits[np.arange(n), np.arange(n)] = -self.LARGE_NUMBER
 
         logprob = F.log_softmax(logits, dim=1)
