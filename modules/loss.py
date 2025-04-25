@@ -79,12 +79,12 @@ class ClusterLoss(torch.nn.Module):
         # Use the original, unnormalized c_i and c_j
         p_i = c_i.sum(0).view(-1)
         p_i /= p_i.sum()
-        ne_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i) + 1e-10).sum()
+        ne_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i+ 1e-10) ).sum()
 
         # Entropy loss for c_j
         p_j = c_j.sum(0).view(-1)
         p_j /= p_j.sum()
-        ne_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j) + 1e-10).sum()
+        ne_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j+ 1e-10) ).sum()
 
         # Combined entropy loss
         ne_loss = ne_i + ne_j
