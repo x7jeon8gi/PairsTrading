@@ -1,6 +1,6 @@
 import torch
 import accelerate
-
+import os
 
 def save_model(args, model, optimizer, current_epoch):
     out = os.path.join(args.model_path, "checkpoint_{}.tar".format(current_epoch))

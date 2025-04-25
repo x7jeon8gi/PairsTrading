@@ -1,4 +1,3 @@
-
 import math
 import torch
 import torch.nn as nn
@@ -102,7 +101,12 @@ class Network(nn.Module):
             return z_i, z_j, c_j
         
     def forward_c(self, x):
+        cls_tokens = self.cls_token.expand(x.size(0), -1).unsqueeze(1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
         x = self.emb_linear(x)
+        x = self.emb_activation(x)
+
         h = self.transformer(x)
         h = h[:,0,:]
         c = self.cluster_projector(h)
@@ -110,9 +114,15 @@ class Network(nn.Module):
         return c
 
     def forward_zc(self, x):
+        cls_tokens = self.cls_token.expand(x.size(0), -1).unsqueeze(1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
         x = self.emb_linear(x)
+        x = self.emb_activation(x)
+
         h = self.transformer(x)
         h = h[:,0,:]
+        
         z = F.normalize(self.instance_projector(h), dim=1)
         c = self.cluster_projector(h)
         c = F.softmax(c, dim=1)

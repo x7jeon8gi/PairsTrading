@@ -23,6 +23,36 @@ color_map = {
     25: '#FF5722', 26: '#795548', 27: '#9E9E9E', 28: '#607D8B', 29: '#000000'
 }
 
+
+def fill_missing_with_flag(df, fill_value=-0.5):
+    """
+    이전 시점에 데이터가 존재했으나 다음 달에 데이터가 NaN인 경우, NaN을 fill_value로 채웁니다.
+    
+    Parameters:
+    - df (pd.DataFrame): 입력 데이터프레임 (행: 종목, 열: 월)
+    - fill_value (float): NaN을 채울 값
+    
+    Returns:
+    - pd.DataFrame: 수정된 데이터프레임
+    """
+    # 컬럼을 연도-월 순으로 정렬 (이미 정렬되어 있다고 가정)
+    sorted_df = df.sort_index(axis=1)
+    
+    # 원본 데이터를 복사하여 이전 달 데이터 시프트
+    prev_month = sorted_df.shift(axis=1)
+    
+    # 마스크 생성: 이전 달에 데이터가 있고, 현재 달이 NaN인 경우
+    mask = prev_month.notna() & sorted_df.isna()
+    
+    # 마스크된 위치의 NaN 값을 fill_value로 대체
+    # 여기서 sorted_df를 수정하지 않고 새로운 DataFrame을 반환
+    filled_df = sorted_df.mask(mask, fill_value)
+    
+    return filled_df
+
+
+
+
 # def get_hdf5_data(dataset: Dataset, ls: list):
 #     """
 #     :param dataset: Dataset object

@@ -1,12 +1,16 @@
 import os
+import gc
 import numpy as np
+import concurrent.futures
 import torch
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 import argparse
 from modules.model import Network
 from modules.dataset import Embedding_dataset
 from modules.loss import InstanceLoss, ClusterLoss
 from modules.train import train_epoch, valid_epoch
-from modules.cluster import inference
+from modules.cluster import inference, inference_parallel
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
@@ -21,8 +25,8 @@ import wandb
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers.optimization import get_linear_schedule_with_warmup
 from glob import glob
-import multiprocessing
-from multiprocessing import set_start_method, Process
+import multiprocessing as mp
+from multiprocessing import set_start_method, Process, Pool
 import asyncio
 from torch.nn.parallel import DistributedDataParallel as DDP
 from functools import partial
@@ -32,6 +36,8 @@ import yaml
 import sys
 import logging
 import argparse
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
 
 class Get_Data():
     def __init__(self, directory, save_path=None):
@@ -53,13 +59,16 @@ class ModelTrainer:
         self.config = config
         self.epochs = self.config['train']['epochs']
         self.batch_size = self.config['train']['batch_size']
+        self.hidden_dim = self.config['model']['hidden_dim']
+        self.n_bins = self.config['model']['n_bins']
+        self.std = self.config['model']['augment_std']
+        self.mask = self.config['model']['masking_ratio']
         self.lr = self.config['train']['lr']
         self.saving_path = self.config['train']['saving_path']
         self.model_saving_strategy = self.config['train']['model_saving_strategy']
         self.seed = self.config['train']['seed']
         self.num_workers = self.config['train']['num_workers']
         self.device = self.config['train']['device']
-        self.epochs = self.config['train']['epochs']
         self.use_accelerator = self.config['train']['use_accelerator']
         self.pin_memory = self.config['train']['pin_memory']
         self.persist_workers = self.config['train']['persist_workers']
@@ -133,6 +142,8 @@ class ModelTrainer:
             device = self.device
             model, criterion_ins, criterion_clu, train_loader, optimizer, scheduler = \
                 model.to(device), criterion_ins.to(device), criterion_clu.to(device), train_loader, optimizer, scheduler
+            if torch.cuda.device_count() > 1:
+                model = nn.DataParallel(model)
 
         # Finally train
         best_loss = 1e10
@@ -173,6 +184,11 @@ class ModelTrainer:
             self.model = accelerator.unwrap_model(model)
         state_dict = model.state_dict()
         
+        # model saving
+        if not os.path.exists(f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}/models"):
+            os.makedirs(f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}/models")
+        torch.save(state_dict, f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}/models/{file_path.split('/')[-1].split('.')[0]}.pt")
+
         if self.config['train']['use_wandb']:
             accelerator.end_training()
 
@@ -190,7 +206,11 @@ class ModelTrainer:
         
         # self.model.load_state_dict(torch.load(f"{self.saving_path}/best_model_{self.config['model']['cluster_num']}_{file_path}.pt"))
         # self.model.load_state_dict(torch.load(f"{self.saving_path}/{self.config['model']['cluster_num']}_{file_path}.pt"))
-        features, prob, clusters = inference(test_loader, self.model, self.device)
+        cuda_count = torch.cuda.device_count()
+        if cuda_count > 1:
+            features, prob, clusters = inference_parallel(test_loader, self.model, self.device)
+        else:
+            features, prob, clusters = inference(test_loader, self.model, self.device)
 
         # No outlier
         clusters = clusters + 1

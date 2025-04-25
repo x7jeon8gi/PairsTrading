@@ -166,7 +166,7 @@ class Embedding_dataset(Dataset):
         일부 Columm을 랜덤하게 0으로 만들어줌 
         """
         if self.masking_ratio is None:
-            masking_ratio = 0.10
+            masking_ratio = 0.01
         else:
             masking_ratio = self.masking_ratio
         N, M = X.shape

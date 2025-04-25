@@ -1,16 +1,15 @@
-data: 'characteristics_us'
-data_refine: # res/batch_128_n_bins_64_hidden_128_std_0.1_mask_0.1/predictions/80_characteristics_us' # ! 학습이 끊겼을시 재실행 / 평소에는 None 줄 것!
+data: 'data/monthly'
+data_refine: # 'res/batch_1024_n_bins_64_hidden_128_std_0.05_mask_0.05/predictions/20_characteristics_us' # ! 학습이 끊겼을시 재실행 / 평소에는 None 줄 것!
 #data_filter_year : 1990
 
-# 아래 파라미터는 클러스터 6개 기준의 best_params로 설정되었음. (OPTUNA hyper parameter tuning)
 model:
   n_bins: 64 # ! bins
   augment_std: 0.1 # ! 재설정
   masking_ratio: 0.1 # ! 재설정
-  cluster_num: 90 # todo 가장 중요한 CLUSTER NUMBER
-  # dim_in_out: 64
+  cluster_num: 90 #! 가장 중요한 CLUSTER NUMBER
+
   # * Below: transformer
-  num_features: 128 # do not change
+  num_features: 36 # do not change
   hidden_dim: 128 # ! hiddens
   depth: 6
   heads: 8
@@ -18,6 +17,8 @@ model:
   use_simple_rmsnorm: True
   cls_init: "ones"
   dropout_mask: 0.1 # 만약 dropout mask만을 사용하고 싶다면 augment_std = masking_ratio = 0.0 설정
+  instance_tau: 0.5  # 기본 값 from paper.
+  cluster_tau: 1.0 # 기본 값 from paper. # tau가 높을수록 소프트맥스 분포를 부드럽게 만듦 (0.5 값은 강한 구분을 유도함)
 
 # 오직 100 epochs 훈련은 부족할 수 있음
 train:
@@ -25,15 +26,17 @@ train:
   saving_path: 'res'
   seed: 0
   num_workers: 4
-  persist_workers: True
+  persist_workers: True # False 값을 추천함.
   pin_memory: True
-  device: "cuda" 
-  epochs: 100
-  batch_size: 256 #! 낮은 Batch가 더 낮은 loss (...?!)
+  device: "cuda"      
+  epochs: 200
+  batch_size: 1024 #! batch
   reload: None
   lr: 0.0003
   warmup_steps: 0
-  use_accelerator: False
+  use_accelerator: False # ! Accelerate 설정 잊지말기
   use_wandb: False
 
-gpu: 'multi' # multi, single
+gpu: 'single' # multi, single
+# multi: 각각의 month를 개별 GPU에 훈련시킴 e.g. 4달 -> 4개 GPU
+# single: 하나의 month를 4개의 GPU에 훈련시킴(if cuda.device_count() > 1)
