@@ -6,7 +6,7 @@ model:
   n_bins: 64 # ! bins
   augment_std: 0.1 # ! 재설정
   masking_ratio: 0.1 # ! 재설정
-  cluster_num: 90 #! 가장 중요한 CLUSTER NUMBER
+  cluster_num: 30 #! 가장 중요한 CLUSTER NUMBER
 
   # * Below: transformer
   num_features: 36 # do not change
@@ -18,7 +18,7 @@ model:
   cls_init: "ones"
   dropout_mask: 0.1 # 만약 dropout mask만을 사용하고 싶다면 augment_std = masking_ratio = 0.0 설정
   instance_tau: 0.5  # 기본 값 from paper.
-  cluster_tau: 1.0 # 기본 값 from paper. # tau가 높을수록 소프트맥스 분포를 부드럽게 만듦 (0.5 값은 강한 구분을 유도함)
+  cluster_tau: 0.5 # 기본 값 from paper. # tau가 높을수록 소프트맥스 분포를 부드럽게 만듦 (0.5 값은 강한 구분을 유도함)
 
 # 오직 100 epochs 훈련은 부족할 수 있음
 train:

@@ -43,3 +43,8 @@ main2.py
 
 portfolio_check_copy.ipynb
 portfolio_check_2.ipynb
+
+.gitignore
+temp_rl/*
+trash/*
+_compare_results_or.py

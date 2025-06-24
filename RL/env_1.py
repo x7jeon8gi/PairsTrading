@@ -7,8 +7,8 @@ from scipy.stats.mstats import winsorize
 import logging
 import copy
 from datetime import datetime, timedelta
-# Add import for the common function
-from utils.strategy_logic import calculate_monthly_portfolio_log_return
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.trading_logic import calculate_positions, calculate_portfolio_returns, LONG_NAN_RETURN, SHORT_NAN_RETURN
 
 
 # ! NEVER USE fill_missing_with_flag
@@ -38,6 +38,8 @@ from utils.strategy_logic import calculate_monthly_portfolio_log_return
     
 #     return filled_df
 
+long_nan_return = -0.25
+short_nan_return = 0.00
 
 class TradingEnvironment:
     """
@@ -93,7 +95,7 @@ class TradingEnvironment:
         self._load_cluster_data(clusters_dir, start_month, end_month)
         
         self.current_step = 0
-
+        self.consecutive_non_negative_steps = 0
     def _setup_reward_function(self, hard_reward, reward_scale):
         """Set up reward function parameters based on configuration."""
         self.hard_reward = hard_reward
@@ -101,7 +103,7 @@ class TradingEnvironment:
         if isinstance(hard_reward, bool) and hard_reward:
             print(f"Hard reward is used. {hard_reward}")
             self.reward_scale = 1
-            self.negative_reward = -10
+            self.negative_reward = - np.abs(reward_scale)
         else:
             self.reward_scale = reward_scale
             
@@ -158,8 +160,8 @@ class TradingEnvironment:
         end_month_1 = end_month_1_dt.strftime('%Y-%m')
         
         # Get sorted file lists
-        self.prob_files = sorted(glob(self.prob_dir + '/*'))
-        self.cluster_files = sorted(glob(clusters_dir + '/*'))
+        self.prob_files = sorted(glob(self.prob_dir + '/*.csv'))
+        self.cluster_files = sorted(glob(clusters_dir + '/*.csv'))
         
         # Filter files by date range
         self.prob_files = [file for file in self.prob_files 
@@ -183,11 +185,16 @@ class TradingEnvironment:
             self.all_prob_data[month] = pd.read_csv(file_path, index_col='firms')
             
     def reset(self):
+        self.rolling_returns = []
+        self.rolling_volatility = 0.0
+        self.window_size = 6
+
         self.current_step = 0
         self.total_reward = 0
         self.current_portfolio_value = 0
         self.max_portfolio_value = 0.0
         self.prev_portfolio_value = self.current_portfolio_value
+        self.consecutive_non_negative_steps = 0
         return self._get_state()
     
     def _get_state(self):
@@ -237,103 +244,145 @@ class TradingEnvironment:
         total_firms = len(clusters)
         cluster_counts = clusters.value_counts()
         n_clusters = len(cluster_counts)
-        max_cluster_ratio = cluster_counts.max() / total_firms
-        cluster_ratios = cluster_counts / total_firms
+        max_cluster_ratio = cluster_counts.max() / total_firms if total_firms > 0 else 0
+        cluster_ratios = cluster_counts / total_firms if total_firms > 0 else pd.Series(dtype=float)
         entropy = - (cluster_ratios * np.log(cluster_ratios + 1e-8)).sum()
-       
+
         n_clusters_norm = n_clusters / 50.0         # 예: 최대 클러스터 수를 50으로 가정
-        entropy_norm = entropy / 5.0                # 예: 최대 엔트로피를 5 정도로 가정
-        # check for nan
+        entropy_norm = entropy / 50                # 예: 최대 엔트로피를 5 정도로 가정
+
+        #* Portfolio State Information
+        # Calculate current positions based on last action (need to store this or recalculate)
+        # For simplicity, let's assume we can recalculate or store from _take_action
+        # Placeholder: Need to access/recalculate long_firms and short_firms count for the *current* step
+        # This might require restructuring how state is obtained relative to action execution.
+        # As a temporary proxy, let's use portfolio value and drawdown.
+
+        #* Temporal Features (Example: Rolling Portfolio Volatility)
+        # self.rolling_returns 리스트 관리 (매 step 마다 log_earning 추가/오래된 값 제거)
+        if len(self.rolling_returns) > self.window_size:
+             self.rolling_returns.pop(0)
+        if len(self.rolling_returns) > 1:
+            self.rolling_volatility = np.std(self.rolling_returns)
+        else:
+            self.rolling_volatility = 0.0 # 초기에는 변동성 0
+
+        # 이전 스텝의 포지션 정보 사용
+        num_long_positions = getattr(self, 'num_long_positions_prev', 0)
+        num_short_positions = getattr(self, 'num_short_positions_prev', 0)
+        long_ratio = num_long_positions / total_firms if total_firms > 0 else 0
+        short_ratio = num_short_positions / total_firms if total_firms > 0 else 0
+        self.current_drawdown = self.max_portfolio_value - self.current_portfolio_value
+
+        # Assemble the state vector
         state_vector = np.array([
-            num_assets, 
-            sp_return, 
-            sp_volatility, 
-            avg_asset_return, 
-            top_asset_return, 
-            bottom_asset_return, 
+            # Market Info
+            num_assets,
+            sp_return,
+            sp_volatility,
+            # Momentum Info
+            avg_asset_return,
+            top_asset_return,
+            bottom_asset_return,
             volatility,
+            # Cluster Info
             n_clusters_norm,
             max_cluster_ratio,
-            entropy_norm
+            entropy_norm,
+            # Portfolio Info (Placeholders/Simplified)
+            #long_ratio, # Requires knowing positions *before* get_state is called for next step
+            #self.current_portfolio_value, # Might need normalization
+            self.current_drawdown, # Might need normalization
+            #self.rolling_volatility
         ], dtype=np.float32)
-        
-        # Debugging: Check if state_vector contains NaN values
-        if np.any(np.isnan(state_vector)):
-            print("Warning: state_vector contains NaN values:", state_vector)
-        
+
+        # Fill NaNs just in case any calculation resulted in NaN
+        state_vector = np.nan_to_num(state_vector, nan=0.0) # Replace NaN with 0
+
+        # Debugging: Check if state_vector contains NaN values (should be handled by nan_to_num)
+        # if np.any(np.isnan(state_vector)):
+        #     print("Warning: state_vector contains NaN values after nan_to_num:", state_vector)
+
         return state_vector
-
-    # def _calculate_current_drawdown(self):
-    #     """
-    #     현재 Drawdown을 계산합니다.
-    #     실제 포트폴리오 가치는 exp(cumulative log return)이므로,
-    #     drawdown = 1 - exp(current_log_return - max_log_return)
-    #     """
-    #     # max_portfolio_log_return가 0보다 작거나 같으면 초기 상태로 간주
-    #     if self.max_portfolio_value <= 0:
-    #         return 0.0
-    #     drawdown = 1 - np.exp(self.current_portfolio_value - self.max_portfolio_value)
-    #     return drawdown
-
 
     def _take_action(self, action, stoploss=0.3):
         """
-        Implement Pairs Trading strategy based on continuous action using the common logic function.
+        Implement Pairs Trading strategy based on continuous action.
         """
-
         threshold = action[0].item()
         outlier_filter = action[1].item()
 
-        # Get current month's data
-        current_month = self.cluster_files[self.current_step].split('/')[-1].split('.')[0]
-        current_cluster_data = self.all_cluster_data[current_month]
-        current_prob_data = self.all_prob_data.get(current_month) # Use .get for safety
-        next_month_returns_series = self.returns_data[self.next_month]
+        # 현재 달 데이터 및 확률 데이터 로드
+        current_month = self.prob_files[self.current_step].split('/')[-1].split('.')[0]
+        prob_data = self.all_prob_data[current_month]
+        
+        # cluster_data 변수명을 current_data로 변경하여 사용
+        cluster_data = self.current_data
+        cluster_data.reset_index(inplace=True)
+        
+        # 공통 트레이딩 로직 사용: 롱/숏 포지션 계산
+        long_firms, short_firms, cluster_data_with_spread = calculate_positions(
+            cluster_data, prob_data, outlier_filter, threshold
+        )
+        long_firms.set_index('firms', inplace=True)
+        short_firms.set_index('firms', inplace=True)
+        # 다음 달 수익률 데이터
+        next_month_returns = self.returns_data[self.next_month].copy()
+        
+        # 공통 트레이딩 로직 사용: 포트폴리오 수익률 계산
+        # 포트폴리오 수익률 계산
+        log_earning, normal_return, long_indices, short_indices, all_indices, \
+        long_firm_returns, short_firm_returns = calculate_portfolio_returns(
+            long_firms=long_firms, 
+            short_firms=short_firms, 
+            next_month_returns=next_month_returns, 
+            stoploss=stoploss
+        )
 
-        # Call the common function to calculate returns and get position info
-        log_earning, long_firms, short_firms, processed_next_returns = \
-            calculate_monthly_portfolio_log_return(
-                current_cluster_data=current_cluster_data,
-                next_month_returns_series=next_month_returns_series,
-                threshold=threshold,
-                stoploss=stoploss,
-                current_prob_data=current_prob_data,
-                outlier_filter=outlier_filter
-            )
+        # 현재 스텝의 포지션 수 저장 (step 함수에서 다음 state 계산 시 사용)
+        self.num_long_positions = len(long_firms)
+        self.num_short_positions = len(short_firms)
 
         # 누적 포트폴리오 로그 수익률 업데이트
         self.current_portfolio_value += log_earning
         if self.current_portfolio_value > self.max_portfolio_value:
             self.max_portfolio_value = self.current_portfolio_value
-
-        # Calculate reward based on selected reward function
-        # Pass the results from the common function if needed by reward calc
-        reward = self._calculate_reward(log_earning, 
-                                     processed_next_returns.loc[processed_next_returns.index.intersection(long_firms.index)], 
-                                     processed_next_returns.loc[processed_next_returns.index.intersection(short_firms.index)])
-
-        return reward
+        
+        # 리워드 계산
+        reward = self._calculate_reward(log_earning, long_firm_returns, short_firm_returns)
+        
+        return log_earning, reward
     
 
     def _calculate_reward(self, log_earning, long_firm_returns, short_firm_returns):
         """
-        Calculate reward based on the selected reward function and incorporate
-        dynamic bonus from the change in portfolio value relative to the previous step.
-        
+        Calculate reward based on portfolio performance.
         Args:
-            log_earning (float): Average log return of the portfolio
-            long_firm_returns (pandas.Series): Log returns of long positions
-            short_firm_returns (pandas.Series): Log returns of short positions
-            
+            log_earning (float): Logarithmic return of the portfolio.
+            long_firm_returns (pd.Series): Returns of long positions.
+            short_firm_returns (pd.Series): Returns of short positions.
         Returns:
-            float: Calculated reward
+            float: Calculated reward.
         """
-        # Binary reward function
-        if isinstance(self.hard_reward, bool) and self.hard_reward:
-            base_reward = log_earning * self.reward_scale if log_earning >= 0 else self.negative_reward
         
-        # Markowitz utility function
-        elif self.hard_reward == 'Markowitz':
+        # Sharpe Ratio 기반 보상
+        if self.hard_reward == "Sharpe":
+            self.rolling_returns.append(log_earning)
+            if len(self.rolling_returns) > self.window_size:
+                self.rolling_returns.pop(0)
+            
+            self.rolling_volatility = np.std(self.rolling_returns)
+            
+            if log_earning > 0 :
+                reward = (log_earning - 0) / (self.rolling_volatility + 1e-8)
+                self.consecutive_non_negative_steps += 1
+            else:
+                reward = -self.dynamic_gamma * np.abs(log_earning)
+                self.consecutive_non_negative_steps = 0
+            return reward
+        
+        # Markowitz 기반 보상
+        elif self.hard_reward == "Markowitz":
             # UQ(r) = U(0) + U′(0)r+ 0.5U′′(0)r^2 = r - (1/2) r^2
             # R = E[U_Q(r)] = E(r) - αV(r)
             r = log_earning
@@ -343,8 +392,8 @@ class TradingEnvironment:
             R = r - alpha * V
             base_reward = R * self.reward_scale
         
-        # Conditional Value at Risk (CVaR)
-        elif self.hard_reward == 'CVaR':
+        # CVaR 기반 보상
+        elif self.hard_reward == "CVaR":
             all_returns = pd.concat([long_firm_returns, short_firm_returns])
             if all_returns.empty:
                 base_reward = 0.0
@@ -355,37 +404,29 @@ class TradingEnvironment:
                 cvar_penalty = abs(cvar)
                 base_reward = (log_earning - self.lambda_cvar * cvar_penalty) * self.reward_scale
         
-        # Sharpe ratio
-        elif self.hard_reward == 'Sharpe':
-            all_returns = pd.concat([long_firm_returns, short_firm_returns])
-            if all_returns.empty:
-                base_reward = 0.0
-            else:
-                avg_return = all_returns.mean()
-                volatility = all_returns.std()
-                sharpe = avg_return / (volatility + 1e-1)
-                base_reward = sharpe * self.reward_scale
-        
-        # Default: simple scaled log return
+        # 기본 보상 로직: 안정적 운용을 위한 위험 회피 보상 함수
         else:
-            base_reward = log_earning * self.reward_scale
+            # 1. 수익률 보상
+            return_reward = log_earning * self.reward_scale
 
-        # Dynamic bonus: incorporate change in portfolio value relative to the previous step
-        gamma_dynamic = self.dynamic_gamma
-        delta_portfolio = self.current_portfolio_value - self.prev_portfolio_value
-        dynamic_bonus = gamma_dynamic * delta_portfolio
+            # 2. 변동성 페널티
+            # self.rolling_returns는 step 함수에서 미리 업데이트 됨
+            self.rolling_volatility = np.std(self.rolling_returns) if len(self.rolling_returns) > 0 else 0
+            volatility_penalty = self.rolling_volatility * 200.0 # 변동성에 대한 페널티 (reward_scale 대비 2배)
 
-        # Total reward combines base reward and dynamic bonus
-        reward = dynamic_bonus# base_reward + dynamic_bonus
-        # Update previous portfolio value for next step
-        self.prev_portfolio_value = self.current_portfolio_value
+            # 3. 최대 낙폭 페널티
+            drawdown = (self.max_portfolio_value - self.current_portfolio_value) / self.max_portfolio_value
+            drawdown_penalty = drawdown * 50.0 # 낙폭에 대한 페널티
 
-        return reward   
+            reward = return_reward - volatility_penalty - drawdown_penalty
+        
+        return reward
 
     def step(self, action, logging=False):
 
-        reward = self._take_action(action)
+        log_earning, reward = self._take_action(action)
         self.total_reward += reward
+        self.rolling_returns.append(log_earning)
         
         self.current_step += 1
         if logging:
@@ -393,5 +434,10 @@ class TradingEnvironment:
         done = self.current_step >= len(self.cluster_files) - 1 #? End of episode
 
         self.done = done
+
+        # 다음 상태 계산 전에 현재 스텝의 포지션 수를 저장
+        self.num_long_positions_prev = getattr(self, 'num_long_positions', 0)
+        self.num_short_positions_prev = getattr(self, 'num_short_positions', 0)
+
         next_state = self._get_state() if not done else np.zeros(self.num_inputs, dtype=np.float32)
         return next_state, reward, done

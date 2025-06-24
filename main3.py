@@ -62,6 +62,7 @@ class ModelTrainer:
         self.n_bins = self.config['model']['n_bins']
         self.std = self.config['model']['augment_std']
         self.mask = self.config['model']['masking_ratio']
+        self.cluster_tau = self.config['model']['cluster_tau']
         self.lr = self.config['train']['lr']
         self.saving_path = self.config['train']['saving_path']
         self.model_saving_strategy = self.config['train']['model_saving_strategy']
@@ -172,9 +173,9 @@ class ModelTrainer:
         clear_gpu_memory()
         
         # model saving
-        # if not os.path.exists(f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}/models"):
-        #     os.makedirs(f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}/models")
-        # torch.save(state_dict, f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}/models/{file_path.split('/')[-1].split('.')[0]}.pt")
+        # if not os.path.exists(f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}_ctau_{self.cluster_tau}/models"):
+        #     os.makedirs(f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}_ctau_{self.cluster_tau}/models")
+        # torch.save(state_dict, f"{self.saving_path}/batch_{self.batch_size}_n_bins_{self.n_bins}_hidden_{self.hidden_dim}_std_{self.std}_mask_{self.mask}_ctau_{self.cluster_tau}/models/{file_path.split('/')[-1].split('.')[0]}.pt")
 
         if self.config['train']['use_wandb']:
             wandb.finish()
@@ -216,8 +217,8 @@ class ModelTrainer:
 
         ##! save
         # Create base paths
-        base_pred_path = os.path.join(self.saving_path, f"batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}", "predictions")
-        base_prob_path = os.path.join(self.saving_path, f"batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}", "prob")
+        base_pred_path = os.path.join(self.saving_path, f"batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}_ctau_{self.cluster_tau}", "predictions")
+        base_prob_path = os.path.join(self.saving_path, f"batch_{batch}_n_bins_{n_bins}_hidden_{hidden_dim}_std_{std}_mask_{mask}_ctau_{self.cluster_tau}", "prob")
         
         # Get filename without path
         filename = os.path.basename(file_path)
@@ -257,7 +258,7 @@ if __name__ == "__main__":
     config = load_yaml_param_settings(args.config)
     
     # config 전체 logging
-    name_of_run = f'{config["model"]["cluster_num"]}_{config["train"]["batch_size"]}_{config["model"]["n_bins"]}_{config["model"]["hidden_dim"]}_{config["model"]["augment_std"]}_{config["model"]["masking_ratio"]}'
+    name_of_run = f'{config["model"]["cluster_num"]}_{config["train"]["batch_size"]}_{config["model"]["n_bins"]}_{config["model"]["hidden_dim"]}_{config["model"]["augment_std"]}_{config["model"]["masking_ratio"]}_{config["model"]["cluster_tau"]}'
     logger = get_logger(name_of_run)
     logger.info("\n" + yaml.dump(config, indent=4, default_flow_style=False))
 
@@ -267,7 +268,7 @@ if __name__ == "__main__":
         logger.info("Overwrite the existing configuration")
 
     logger.info(f"\n Number of Cluster: {config['model']['cluster_num']}, Batch size: {config['train']['batch_size']}, Data_refine path: {config['data_refine']},\
-            \n n_bins: {config['model']['n_bins']}, hidden_dim: {config['model']['hidden_dim']}, masking_ratio: {config['model']['masking_ratio']}, augment_std: {config['model']['augment_std']}")
+            \n n_bins: {config['model']['n_bins']}, hidden_dim: {config['model']['hidden_dim']}, masking_ratio: {config['model']['masking_ratio']}, augment_std: {config['model']['augment_std']}, cluster_tau: {config['model']['cluster_tau']}")
 
     # Save the configuration
     if not os.path.exists(config['train']['saving_path']):

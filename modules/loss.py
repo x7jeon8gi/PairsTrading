@@ -23,6 +23,7 @@ class InstanceLoss(nn.Module):
         n = z.shape[0] # batch size
         assert n % self.multiplier ==0
         
+        z = F.normalize(z, p=2, dim=1)
         logits = z @ z.t()
         logits /= self.tau # apply temperature scaling
         logits[np.arange(n), np.arange(n)] =- self.LARGE_NUMBER # diagonal
@@ -48,7 +49,7 @@ class ClusterLoss(torch.nn.Module):
         self.multiplier = multiplier
 
     def forward(self, c): #  c: softmaxed probability distribution
-        n = c.shape[0]
+        n = c.shape[0] # (2*Batch   )
         assert n % self.multiplier == 0
         half_n = n // 2  # Assuming c = torch.cat([c_i, c_j])
 
@@ -57,9 +58,9 @@ class ClusterLoss(torch.nn.Module):
         c_i = c[:half_n]
         c_j = c[half_n:]
 
-        # todo: erase-> c = F.normalize(c, p=2, dim=1) / np.sqrt(self.tau)
         # --- Start: Contrastive Loss Calculation ---
-        logits = c @ c.t() 
+        c = F.normalize(c, p=2, dim=1) # Cosine similarity l2 normalization 
+        logits = c @ c.t() # Cosine similarity dot product
         logits /= self.tau # apply temperature scaling
         logits[np.arange(n), np.arange(n)] = -self.LARGE_NUMBER
 

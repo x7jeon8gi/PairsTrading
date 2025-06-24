@@ -38,6 +38,12 @@ class SAC(object):
             self.critic_target = QNetwork(num_inputs, num_action, hidden_size).to(self.device)
             self.critic_target.load_state_dict(self.critic.state_dict()) # copy parameters
     
+            # Target Entropy = −dim(A) (e.g. , -2 for Continuous Action Space)
+            self.target_entropy = -torch.prod(torch.Tensor(self.action_space.shape).to(self.device)).item()
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            self.alpha_optim = Adam([self.log_alpha], lr=lr)
+            self.alpha = self.log_alpha.exp() # alpha 값은 항상 양수여야 함
+
             self.actor = GaussianPolicy(num_inputs, num_action, hidden_size, self.action_space).to(self.device)
             self.policy_optim = Adam(self.actor.parameters(), lr=lr) 
     
@@ -79,6 +85,13 @@ class SAC(object):
         # Policy update
         new_action, log_pi, _ = self.actor.sample(state)
 
+        # Alpha loss
+        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+        self.alpha_optim.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optim.step()
+        self.alpha = self.log_alpha.exp()
+
         qf1_pi, qf2_pi = self.critic(state, new_action)
         min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
@@ -93,7 +106,7 @@ class SAC(object):
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
         
-        return qf1_loss.item(), qf2_loss.item(), policy_loss.item()
+        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item()
     
     def save_model(self, dir, name):
         if not os.path.exists(dir):
@@ -103,13 +116,20 @@ class SAC(object):
         torch.save(self.critic_target.state_dict(), '%s/%s_critic_target.pth' % (dir, name))
         torch.save(self.policy_optim.state_dict(), '%s/%s_policy_optim.pth' % (dir, name))
         torch.save(self.critic_optim.state_dict(), '%s/%s_critic_optim.pth' % (dir, name))
-    
+        torch.save(self.log_alpha, '%s/%s_log_alpha.pth' % (dir, name)) # log_alpha 저장
+
     def load_model(self, dir, name):
         self.actor.load_state_dict(torch.load('%s/%s_actor.pth' % (dir, name),  map_location= self.device))
         self.critic.load_state_dict(torch.load('%s/%s_critic.pth' % (dir, name), map_location= self.device))
         # self.critic_target.load_state_dict(torch.load('%s/%s_critic_target.pth' % (dir, name)))
         # self.policy_optim.load_state_dict(torch.load('%s/%s_policy_optim.pth' % (dir, name)))
         # self.critic_optim.load_state_dict(torch.load('%s/%s_critic_optim.pth' % (dir, name)))
+        try:
+            self.log_alpha = torch.load('%s/%s_log_alpha.pth' % (dir, name), map_location=self.device)
+            self.alpha = self.log_alpha.exp()
+        except FileNotFoundError:
+            print("log_alpha not found, using default alpha.")
+
         self.actor.eval()
         self.critic.eval()
         # self.critic_target.eval()  
