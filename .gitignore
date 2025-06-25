@@ -17,7 +17,10 @@ data/*
 configs/vae_config.yaml
 log/*
 output/*
-
+temp/*
+temp_rl/*
+trash/*
+RL_dreamer/*
 
 RL_advanced/*
 SAC_ML/*
@@ -26,20 +29,19 @@ SAC_ML_old/*
 VAE/*
 
 compare_results.ipynb
-compare_results.py
 compare_results2.py
 
 main_vae.py
 main_han.py
 
-main.py
 main2.py
 
 *.pkl
 *.csv
 *.json
-*.yaml
 *.yml
 
 portfolio_check_copy.ipynb
 portfolio_check_2.ipynb
+
+.gitignore

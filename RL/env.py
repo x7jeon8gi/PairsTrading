@@ -10,37 +10,6 @@ from datetime import datetime, timedelta
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.trading_logic import calculate_positions, calculate_portfolio_returns, LONG_NAN_RETURN, SHORT_NAN_RETURN
 
-
-# ! NEVER USE fill_missing_with_flag
-# def fill_missing_with_flag(df, fill_value=-0.5):
-#     """
-#     이전 시점에 데이터가 존재했으나 다음 달에 데이터가 NaN인 경우, NaN을 fill_value로 채웁니다.
-    
-#     Parameters:
-#     - df (pd.DataFrame): 입력 데이터프레임 (행: 종목, 열: 월)
-#     - fill_value (float): NaN을 채울 값
-    
-#     Returns:
-#     - pd.DataFrame: 수정된 데이터프레임
-#     """
-#     # 컬럼을 연도-월 순으로 정렬 (이미 정렬되어 있다고 가정)
-#     sorted_df = df.sort_index(axis=1)
-    
-#     # 원본 데이터를 복사하여 이전 달 데이터 시프트
-#     prev_month = sorted_df.shift(axis=1)
-    
-#     # 마스크 생성: 이전 달에 데이터가 있고, 현재 달이 NaN인 경우
-#     mask = prev_month.notna() & sorted_df.isna()
-    
-#     # 마스크된 위치의 NaN 값을 fill_value로 대체
-#     # 여기서 sorted_df를 수정하지 않고 새로운 DataFrame을 반환
-#     filled_df = sorted_df.mask(mask, fill_value)
-    
-#     return filled_df
-
-long_nan_return = -0.25
-short_nan_return = 0.00
-
 class TradingEnvironment:
     """
     Designed for Soft Actor Critic (SAC) algorithm.
@@ -195,6 +164,11 @@ class TradingEnvironment:
         self.max_portfolio_value = 0.0
         self.prev_portfolio_value = self.current_portfolio_value
         self.consecutive_non_negative_steps = 0
+        
+        # 새로운 보상 함수를 위한 변수 초기화
+        self.prev_rolling_sharpe = 0.0
+        self.prev_drawdown = 0.0
+        
         return self._get_state()
     
     def _get_state(self):
@@ -449,6 +423,96 @@ class TradingEnvironment:
                 sharpe = avg_return / (volatility + 1e-1)
                 base_reward = sharpe * self.reward_scale
         
+        elif self.hard_reward == 'ReturnVolatilityDrawdown':
+            # Hyperparameters to balance return, volatility, and drawdown
+            RETURN_SCALE = 1.0
+            VOLATILITY_PENALTY_SCALE = 2.0
+            DRAWDOWN_PENALTY_SCALE = 1.0
+
+            # 1. Return component
+            return_component = RETURN_SCALE * log_earning
+
+            # 2. Volatility penalty component
+            # A temporary list is used to include the current return for volatility calculation
+            temp_rolling_returns = self.rolling_returns + [log_earning]
+            if len(temp_rolling_returns) > 1:
+                rolling_volatility = np.std(temp_rolling_returns)
+            else:
+                rolling_volatility = 0.0
+            
+            volatility_penalty = VOLATILITY_PENALTY_SCALE * rolling_volatility
+
+            # 3. Drawdown penalty component
+            drawdown = self.max_portfolio_value - self.current_portfolio_value
+            drawdown_penalty = DRAWDOWN_PENALTY_SCALE * drawdown
+
+            # The base reward is calculated by maximizing returns while minimizing penalties.
+            base_reward = return_component - volatility_penalty - drawdown_penalty
+        
+        elif self.hard_reward == 'ImprovedSharpe':
+            # Hyperparameters
+            SHARPE_BONUS_SCALE = 0.5 
+            DRAWDOWN_BONUS_SCALE = 0.5
+            MIN_OBS_FOR_SHARPE = 12 # Minimum months of returns to calculate a stable Sharpe ratio
+
+            # 1. Sharpe Improvement Bonus
+            sharpe_bonus = 0.0
+            # Add current return to calculate new rolling sharpe
+            current_rolling_returns = self.rolling_returns + [log_earning] 
+            if len(current_rolling_returns) >= MIN_OBS_FOR_SHARPE:
+                returns_series = pd.Series(current_rolling_returns)
+                mean_return = returns_series.mean()
+                std_dev = returns_series.std()
+                current_rolling_sharpe = mean_return / (std_dev + 1e-8)
+                
+                sharpe_bonus = SHARPE_BONUS_SCALE * (current_rolling_sharpe - getattr(self, 'prev_rolling_sharpe', 0.0))
+                
+                self.prev_rolling_sharpe = current_rolling_sharpe
+            else:
+                self.prev_rolling_sharpe = 0.0
+
+            # 2. Drawdown Reduction Bonus
+            current_drawdown = self.max_portfolio_value - self.current_portfolio_value
+            drawdown_bonus = DRAWDOWN_BONUS_SCALE * (getattr(self, 'prev_drawdown', 0.0) - current_drawdown)
+            self.prev_drawdown = current_drawdown
+
+            # The base reward is the sum of the shaping bonuses. 
+            # The direct log_earning reward will be added later via the dynamic_bonus.
+            base_reward = sharpe_bonus + drawdown_bonus
+        
+        elif self.hard_reward == 'Sortino':
+            # This reward function is based on the Sortino ratio concept,
+            # which focuses on penalizing downside volatility rather than total volatility.
+            
+            # Combine returns from all positions in the current step
+            all_returns = pd.concat([long_firm_returns, short_firm_returns])
+            
+            if all_returns.empty:
+                # No positions taken, no risk, no reward.
+                base_reward = 0.0
+            else:
+                # The portfolio's log return for the step.
+                portfolio_return = log_earning
+                
+                # Identify returns that fall below the target (downside returns).
+                # We use a target return of 0, meaning we penalize any loss.
+                target_return = 0.0
+                downside_returns = all_returns[all_returns < target_return]
+                
+                # Calculate the standard deviation of downside returns.
+                # This is the measure of downside risk.
+                if not downside_returns.empty:
+                    downside_deviation = downside_returns.std()
+                else:
+                    # If there are no losses, downside risk is zero.
+                    downside_deviation = 0.0
+                
+                # Calculate a step-based Sortino-like ratio.
+                # A small epsilon is added to avoid division by zero if there's no downside risk.
+                sortino_step_reward = portfolio_return / (downside_deviation + 1e-8)
+                
+                base_reward = sortino_step_reward * self.reward_scale
+
         elif self.hard_reward == 'Rolling_Sharpe':
             if len(self.rolling_returns) > 1:
                 returns_series = pd.Series(self.rolling_returns)

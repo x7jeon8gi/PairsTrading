@@ -62,7 +62,7 @@ def calculate_monthly_portfolio_log_return(
                                            left_index=True, # Simpler assumption
                                            right_index=True, # Simpler assumption
                                            how='left')
-        combined_data['max_prob'].fillna(0, inplace=True) # Handle missing firms in prob_data
+        combined_data['max_prob'] = combined_data['max_prob'].fillna(0) # Handle missing firms in prob_data
         quantile_threshold = combined_data['max_prob'].quantile(outlier_filter)
         combined_data['clusters'] = np.where(combined_data['max_prob'] > quantile_threshold,
                                              combined_data['clusters'], 0)

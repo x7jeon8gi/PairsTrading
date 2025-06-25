@@ -1,0 +1,34 @@
+batch_size: 1024
+start_steps: 3000
+n_steps: 100001
+num_cluster: 40  # ! Num_clusters
+save_name: '0.0001_master' #! Name of the model
+seed: 42
+replay_size: 1000000 
+update_per_step: 1
+
+env_args:
+  returns_data: './data/log_returns_by_month.pkl'
+  use_winsorize: False
+  clusters_dir: './res/batch_1024_n_bins_64_hidden_128_std_0.1_mask_0.1_ctau_1.0/predictions/'
+  start_month: '1995-01'
+  end_month: '2005-12'
+  reward_scale: 1 #* Scale 
+  num_inputs: 11
+  hard_reward: 'Sortino' # ! Use Sortino reward function
+  dynamic_gamma: 0.0001 # ! Set to 0 to provide a clean reward signal
+
+agent_args:
+  agent_type: "SAC"    # Type of agent
+  num_inputs: 11 #25-03-11 : State 증가 
+  num_action: 2
+  action_space: [[0.0, 0.0] , [2.5, 0.8]] # 첫번째 차원(thres) 최소값 0.0, 최대값 2.5 / 두번째 차원(outlier) 최소값 0.25, 최대값 0.75
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.003
+  kl_weight : 0 
+  alpha: 0.2
+  group_size: 8 # ! group size
+  target_update_interval: 1
+  hidden_size: [256,256,256]
+
