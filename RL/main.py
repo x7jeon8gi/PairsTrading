@@ -76,6 +76,9 @@ class Trainer(object):
                  replay_size,
                  update_per_step,
                  logger,
+                 use_per=False,
+                 per_alpha=0.6,
+                 per_beta=0.4,
                  eval_interval=100,
                  eval_episodes=10):
 
@@ -93,6 +96,7 @@ class Trainer(object):
         self.num_actions = agent_args['num_action']
         self.eval_interval = eval_interval
         self.eval_episodes = eval_episodes
+        self.use_per = use_per
 
         # ! 환경 초기화
         self.env    = TradingEnvironment(**env_args)
@@ -127,7 +131,15 @@ class Trainer(object):
         else:
             raise ValueError("Unknown agent_type specified in agent_args")
 
-        self.memory = ReplayMemory(replay_size, seed)
+        if self.use_per:
+            from replay_memory import PrioritizedReplayMemory
+            self.memory = PrioritizedReplayMemory(replay_size, seed, alpha=per_alpha, beta=per_beta)
+            self.logger.info("Using Prioritized Experience Replay")
+        else:
+            from replay_memory import ReplayMemory
+            self.memory = ReplayMemory(replay_size, seed)
+            self.logger.info("Using standard Replay Memory")
+            
         self.logger = logger
         self.max_reward = -float('inf')
 
@@ -164,11 +176,14 @@ class Trainer(object):
 
                 if len(self.memory) > self.batch_size:
                     for _ in range(self.update_per_step):
-                        critic_1_loss, critic_2_loss, policy_loss = self.agent.update_parameters(self.memory, self.batch_size, updates)
+                        critic_1_loss, critic_2_loss, policy_loss, alpha_loss = self.agent.update_parameters(self.memory, self.batch_size, updates)
                         updates += 1
 
                         if updates % 10000 == 0:
-                            self.logger.info(f"Updates: {updates} | C1 Loss: {critic_1_loss:.4f} | C2 Loss: {critic_2_loss:.4f} | Policy Loss: {policy_loss:.4f}")
+                            log_msg = (f"Updates: {updates} | C1 Loss: {critic_1_loss:.4f} | "
+                                       f"C2 Loss: {critic_2_loss:.4f} | Policy Loss: {policy_loss:.4f} | "
+                                       f"Alpha Loss: {alpha_loss:.4f} | Alpha: {self.agent.alpha.item():.4f}")
+                            self.logger.info(log_msg)
 
                 next_state, reward, done = self.env.step(action, logging=False)
                 total_numsteps += 1
@@ -555,6 +570,7 @@ if __name__ == "__main__":
                         help='random seed (default: 42)')
     parser.add_argument('--batch_size', type=int, default=1024, metavar='N',
                         help='batch size (default: 256)')
+   
 
     # * Arguments
     # 기본적으로 Yaml을 따르나, argparse로 받은 인자가 있다면 해당 인자로 덮어씌움
@@ -612,7 +628,11 @@ if __name__ == "__main__":
                     agent_args=agent_args,
                     update_per_step= update_per_step,
                     replay_size=replay_size,
-                    logger=logger)
+                    logger=logger,
+                    use_per=config.get('use_per', False),
+                    per_alpha=config.get('per_alpha', 0.6),
+                    per_beta=config.get('per_beta', 0.4)
+                    )
     
     trainer.train()
     total_reward, rewards, actions, portfolio_values, states = trainer.inference('./res/RL/models', save_name)

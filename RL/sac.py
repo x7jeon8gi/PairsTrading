@@ -23,7 +23,7 @@ class SAC(object):
             
             self.gamma = gamma
             self.tau = tau
-            self.alpha = alpha
+            self.alpha_value = alpha  # Keep original alpha for cases where automatic tuning is off
             self.agent_type = agent_type
             self.action_space = spaces.Box(low= np.array(action_space[0]), high= np.array(action_space[1]), dtype=np.float32)
             self.target_update_interval = target_update_interval
@@ -41,6 +41,12 @@ class SAC(object):
             self.actor = GaussianPolicy(num_inputs, num_action, hidden_size, self.action_space).to(self.device)
             self.policy_optim = Adam(self.actor.parameters(), lr=lr) 
     
+            # Automatic Entropy Tunning
+            self.target_entropy = -torch.prod(torch.Tensor(self.action_space.shape).to(self.device)).item()
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            self.alpha_optim = Adam([self.log_alpha], lr=lr)
+            self.alpha = self.log_alpha.exp() # Alpha is a learned parameter
+    
             self.critic_target.eval()
             self.value_criterion = F.mse_loss
             
@@ -54,22 +60,36 @@ class SAC(object):
             return action_mean.detach().cpu().numpy()[0]
     
     def update_parameters(self, memory, batch_size, updates):
-        # sample from replay buffer
-        state, action, reward, next_state, mask = memory.sample(batch_size=batch_size)
-        state, action, reward, next_state, mask = map(lambda x: torch.FloatTensor(x).to(self.device), 
-                                                      [state, action, reward, next_state, mask])
-        reward, mask = reward.unsqueeze(-1), mask.unsqueeze(-1)
+        # sample from prioritized replay buffer
+        (state, action, reward, next_state, mask), idxs, is_weights = memory.sample(batch_size=batch_size)
+        
+        state, action, reward, next_state, mask, is_weights = map(
+            lambda x: torch.FloatTensor(x).to(self.device),
+            [state, action, reward, next_state, mask, is_weights]
+        )
+        reward, mask, is_weights = reward.unsqueeze(-1), mask.unsqueeze(-1), is_weights.unsqueeze(-1)
+
 
         with torch.no_grad():
             next_state_action, next_state_log_pi, _ = self.actor.sample(next_state)
             qf1_next_target, qf2_next_target = self.critic_target(next_state, next_state_action)
             min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-            next_q_value = reward + mask * self.gamma * (min_qf_next_target) # Q(s', a') : TD target
+            next_q_value = reward + mask * self.gamma * (min_qf_next_target)
         
         # Critics update
-        qf1, qf2 = self.critic(state, action) # Two Q-functions to mitigate positive bias in the policy improvement step
-        qf1_loss = self.value_criterion(qf1, next_q_value) # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
-        qf2_loss = self.value_criterion(qf2, next_q_value) # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+        qf1, qf2 = self.critic(state, action)
+        
+        # Calculate TD errors for PER priority update
+        td_error1 = (qf1 - next_q_value).abs()
+        td_error2 = (qf2 - next_q_value).abs()
+        # Use the mean of the two TD errors for priority
+        priorities = ((td_error1 + td_error2) / 2.0).detach().cpu().numpy()
+
+        # Update priorities in the replay buffer
+        memory.update_priorities(idxs, priorities.flatten())
+
+        qf1_loss = (is_weights * F.mse_loss(qf1, next_q_value, reduction='none')).mean()
+        qf2_loss = (is_weights * F.mse_loss(qf2, next_q_value, reduction='none')).mean()
         critic_loss = qf1_loss + qf2_loss
 
         self.critic_optim.zero_grad()
@@ -88,33 +108,41 @@ class SAC(object):
         policy_loss.backward()
         self.policy_optim.step()
 
+        # Alpha (Entropy term) update
+        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+
+        self.alpha_optim.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optim.step()
+        self.alpha = self.log_alpha.exp() # Update alpha
+
         # update target networks
         if updates % self.target_update_interval == 0:
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
         
-        return qf1_loss.item(), qf2_loss.item(), policy_loss.item()
+        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item()
     
     def save_model(self, dir, name):
         if not os.path.exists(dir):
             os.makedirs(dir)
         torch.save(self.actor.state_dict(), '%s/%s_actor.pth' % (dir, name))
         torch.save(self.critic.state_dict(), '%s/%s_critic.pth' % (dir, name))
-        torch.save(self.critic_target.state_dict(), '%s/%s_critic_target.pth' % (dir, name))
-        torch.save(self.policy_optim.state_dict(), '%s/%s_policy_optim.pth' % (dir, name))
-        torch.save(self.critic_optim.state_dict(), '%s/%s_critic_optim.pth' % (dir, name))
-    
+        torch.save(self.log_alpha, '%s/%s_log_alpha.pth' % (dir, name))
+        torch.save(self.alpha_optim.state_dict(), '%s/%s_alpha_optim.pth' % (dir, name))
+
     def load_model(self, dir, name):
         self.actor.load_state_dict(torch.load('%s/%s_actor.pth' % (dir, name),  map_location= self.device))
         self.critic.load_state_dict(torch.load('%s/%s_critic.pth' % (dir, name), map_location= self.device))
-        # self.critic_target.load_state_dict(torch.load('%s/%s_critic_target.pth' % (dir, name)))
-        # self.policy_optim.load_state_dict(torch.load('%s/%s_policy_optim.pth' % (dir, name)))
-        # self.critic_optim.load_state_dict(torch.load('%s/%s_critic_optim.pth' % (dir, name)))
+        
+        # Load log_alpha and its optimizer if they exist
+        log_alpha_path = '%s/%s_log_alpha.pth' % (dir, name)
+        if os.path.exists(log_alpha_path):
+            self.log_alpha = torch.load(log_alpha_path, map_location=self.device)
+        
+        alpha_optim_path = '%s/%s_alpha_optim.pth' % (dir, name)
+        if os.path.exists(alpha_optim_path):
+            self.alpha_optim.load_state_dict(torch.load(alpha_optim_path, map_location=self.device))
+
         self.actor.eval()
         self.critic.eval()
-        # self.critic_target.eval()  
-        # self.actor.to(self.device)
-        # self.critic.to(self.device)
-        # self.critic_target.to(self.device)
-        # self.policy_optim.to(self.device)
-        # self.critic_optim.to(self.device)

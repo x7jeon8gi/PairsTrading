@@ -6,6 +6,11 @@ save_name: '0.0001_master' #! Name of the model
 seed: 42
 replay_size: 1000000 
 update_per_step: 1
+use_per: True # ! Whether to use Prioritized Experience Replay
+
+# PER-specific hyperparameters
+per_alpha: 0.6
+per_beta: 0.4
 
 env_args:
   returns_data: './data/log_returns_by_month.pkl'
