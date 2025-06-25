@@ -97,6 +97,9 @@ class Trainer(object):
         self.eval_interval = eval_interval
         self.eval_episodes = eval_episodes
         self.use_per = use_per
+        self.per_alpha = per_alpha
+        self.per_beta = per_beta
+        self.logger = logger
 
         # ! 환경 초기화
         self.env    = TradingEnvironment(**env_args)
@@ -140,7 +143,6 @@ class Trainer(object):
             self.memory = ReplayMemory(replay_size, seed)
             self.logger.info("Using standard Replay Memory")
             
-        self.logger = logger
         self.max_reward = -float('inf')
 
         # Create model directory if it doesn't exist
