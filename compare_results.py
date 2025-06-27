@@ -63,7 +63,7 @@ class StrategyConfig:
             self.rl_config['env_args']['hard_reward'] = hard_reward
             
         self.current_time = datetime.datetime.now(korean_tz).strftime('%Y%m%d_%H%M%S')
-        self.output_dir = './res'
+        self.output_dir = './res/compare_results'
         self.cache_dir = './res/cached_results'
         self.save_output = True
 

@@ -215,6 +215,7 @@ class GRPOAgent:
             else:
                 # 학습 시 trajectory는 old_policy에서 수집
                 action, log_prob, _ = self.old_policy.sample(state)
+                # SAC와 일관성을 위해 튜플 반환 (action, log_prob)
                 return action.cpu().detach().numpy()[0], log_prob.cpu().detach().item()
 
     def collect_trajectory(self, env, max_steps):
@@ -224,8 +225,8 @@ class GRPOAgent:
         done = False
         steps = 0
         while not done and steps < max_steps:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            action, log_prob = self.select_action(state_tensor, evaluate=False) # Still use old_policy logic internally
+            # select_action이 이미 state를 적절히 처리하므로 직접 전달
+            action, log_prob = self.select_action(state, evaluate=False)
             next_state, reward, done = env.step(action)
 
             states.append(state)
@@ -259,6 +260,10 @@ class GRPOAgent:
             loss = self.loss_fn(self.policy, group_trajectories, self.device)
             self.optimizer.zero_grad()
             loss.backward()
+            
+            # 🔧 Gradient clipping for stability (SAC와 동일)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
+            
             self.optimizer.step()
         self.old_policy.load_state_dict(self.policy.state_dict())
         return loss.item()

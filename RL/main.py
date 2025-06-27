@@ -23,7 +23,7 @@ from utils.seed import seed_everything
 from utils import calculate_metrics
 from utils.metrics import calculate_financial_metrics_monthly
 import logging
-from collector import DataCollector
+from collector import DataCollector, TrajectoryCollector
 import torch.multiprocessing as mp
 
 # Set the start method for multiprocessing
@@ -162,24 +162,44 @@ class Trainer(object):
         os.makedirs('./res/RL/models', exist_ok=True)
         os.makedirs('./res/RL/rewards', exist_ok=True)
         
+        # 환경 초기화 (GRPO를 위해 필요)
+        from env import TradingEnvironment
+        self.env = TradingEnvironment(**self.env_args)
+        
         # --- 비동기 파이프라인 설정 ---
-        self.experience_queue = mp.Queue(maxsize=1000)
-        self.policy_queue = mp.Queue(maxsize=self.num_collectors)
+        if agent_type == "SAC":
+            # SAC용 경험 수집
+            self.experience_queue = mp.Queue(maxsize=1000)
+            self.policy_queue = mp.Queue(maxsize=self.num_collectors)
+        else:
+            # GRPO용 trajectory 수집
+            self.trajectory_queue = mp.Queue(maxsize=100)
+            self.policy_queue = mp.Queue(maxsize=self.num_collectors)
 
         self.collectors = []
         for i in range(self.num_collectors):
             collector_seed = self.seed + i
-            collector = DataCollector(
-                self.env_args,
-                self.agent_args,
-                self.experience_queue,
-                self.policy_queue,
-                collector_seed,
-                collector_id=i
-            )
+            if agent_type == "SAC":
+                collector = DataCollector(
+                    self.env_args,
+                    self.agent_args,
+                    self.experience_queue,
+                    self.policy_queue,
+                    collector_seed,
+                    collector_id=i
+                )
+            else:  # GRPO
+                collector = TrajectoryCollector(
+                    self.env_args,
+                    self.agent_args,
+                    self.trajectory_queue,
+                    self.policy_queue,
+                    collector_seed,
+                    collector_id=i
+                )
             collector.start()
             self.collectors.append(collector)
-            self.logger.info(f"DataCollector {i} started with seed {collector_seed}.")
+            self.logger.info(f"{'DataCollector' if agent_type == 'SAC' else 'TrajectoryCollector'} {i} started with seed {collector_seed}.")
 
 
     def train_offline(self):
@@ -252,8 +272,9 @@ class Trainer(object):
 
 
     def train_online(self):
-        """Online training loop for PPO/GRPO (group-based updates)"""
+        """Online training loop for PPO/GRPO (group-based updates) with async trajectory collection"""
         total_numsteps = 0
+        updates = 0
         rewards = []
         group_trajectories = []
         episode_num = 0
@@ -261,24 +282,45 @@ class Trainer(object):
         progress_bar = tqdm(total=self.n_steps, desc="Training Progress")
         episode_rewards_history = [] # List to store episode rewards
 
+        # 초기 정책을 TrajectoryCollector들에게 브로드캐스트
+        policy_state_dict = {k: v.cpu() for k, v in self.agent.policy.state_dict().items()}
+        for _ in range(self.num_collectors):
+            self.policy_queue.put(policy_state_dict)
+
         while total_numsteps < self.n_steps:
-            # collect trajectories from old policy
-            trajectory = self.agent.collect_trajectory(self.env, max_steps=200) # states, actions, log_porbs, rewards
-            group_trajectories.append(trajectory)
+            # 1. trajectory 수집 (비동기)
+            try:
+                trajectory = self.trajectory_queue.get(timeout=1)
+                group_trajectories.append(trajectory)
+                
+                episode_reward = sum(trajectory['rewards'])
+                episode_rewards_history.append(episode_reward)
+                total_numsteps += len(trajectory['states'])
+                episode_num += 1
+                progress_bar.update(len(trajectory['states']))
+                
+                self.logger.info(f'Episode: {episode_num} | Total Steps: {total_numsteps} | Episode Reward: {episode_reward:.4f}')
+            except:
+                # 큐가 비어있으면 잠시 대기 후 계속
+                continue
 
-            episode_reward = sum(trajectory['rewards'])
-            episode_rewards_history.append(episode_reward) # Store episode reward
-            total_numsteps += len(trajectory['states'])
-            episode_num += 1
-
+            # 2. 그룹이 찼으면 업데이트
             if len(group_trajectories) >= group_size:
-                update_loss = self.agent.grpo_update(group_trajectories, n_iterations=20) # n_iterations: 국밥
-                self.logger.info(f'Online Update at Episode: {episode_num} | Loss: {update_loss:.4f}')
+                update_loss = self.agent.grpo_update(group_trajectories, n_iterations=20)
+                updates += 1
+                self.logger.info(f'Online Update at Episode: {episode_num} | Updates: {updates} | Loss: {update_loss:.4f}')
                 group_trajectories = []  # reset group
+                
+                # 최신 정책을 TrajectoryCollector들에게 전송
+                if updates % 5 == 0:  # 5번 업데이트마다 정책 동기화
+                    policy_state_dict = {k: v.cpu() for k, v in self.agent.policy.state_dict().items()}
+                    # 큐가 비어있을 때만 넣어서 너무 많이 쌓이지 않도록 함
+                    if self.policy_queue.empty():
+                        for _ in range(self.num_collectors):
+                            self.policy_queue.put(policy_state_dict)
 
-            self.logger.info(f'Episode: {episode_num} | Total Steps: {total_numsteps} | Episode Reward: {episode_reward:.4f}')
-
-            if episode_num % self.eval_interval == 0:
+            # 3. 주기적인 평가 (에피소드 기준)
+            if episode_num > 0 and episode_num % self.eval_interval == 0:
                 avg_reward = self._evaluate_agent(self.eval_episodes)
                 rewards.append(avg_reward)
                 self.logger.info(f'Evaluation at Episode: {episode_num} | Total Steps: {total_numsteps} | Average Reward: {avg_reward:.4f}')
@@ -287,8 +329,6 @@ class Trainer(object):
                     self.max_avg_reward = avg_reward
                     self.agent.save_model('./res/RL/models', self.save_name)
                     self.logger.info(f'********** New best model saved with avg reward: {self.max_avg_reward:.4f} **********')
-
-            progress_bar.update(len(trajectory['states']))
             
             # Break loop if n_steps reached
             if total_numsteps >= self.n_steps:
@@ -302,6 +342,12 @@ class Trainer(object):
         # Save the plot of episode rewards
         self._save_reward_plot(episode_rewards_history, xlabel='Episode')
         self.logger.info("Online training completed.")
+        
+        # 학습 종료 후 TrajectoryCollector 프로세스 정리
+        for collector in self.collectors:
+            collector.terminate()
+            collector.join()
+        self.logger.info("All TrajectoryCollectors terminated.")
 
     def train(self):
         """Main train method selecting offline or online training based on agent type."""

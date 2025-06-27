@@ -68,3 +68,85 @@ class DataCollector(mp.Process):
                 episode_steps = 0
             else:
                 state = next_state
+
+
+class TrajectoryCollector(mp.Process):
+    """
+    GRPO용 trajectory 수집기 - 전체 에피소드를 수집하여 큐로 보냄
+    """
+    def __init__(self, env_args, agent_args, trajectory_queue, policy_queue, seed, collector_id=0, max_steps=200):
+        super(TrajectoryCollector, self).__init__()
+        self.env_args = env_args
+        self.agent_args = agent_args
+        self.trajectory_queue = trajectory_queue
+        self.policy_queue = policy_queue
+        self.seed = seed
+        self.collector_id = collector_id
+        self.max_steps = max_steps
+        self.daemon = True
+
+    def run(self):
+        """프로세스 실행 시 호출되는 메인 메소드."""
+        print(f"[TrajectoryCollector {self.collector_id}] Starting...")
+        
+        # GRPO agent 초기화
+        from grpo import GRPOAgent
+        
+        # 환경 초기화
+        env, _ = setup_collector_process(self.env_args, self.agent_args, self.seed)
+        
+        # GRPO 에이전트만 초기화 (policy만 필요)
+        state_dim = self.agent_args['num_inputs']
+        action_dim = self.agent_args['num_action']
+        hidden_sizes = self.agent_args['hidden_size']
+        action_space = self.agent_args['action_space']
+        lr = self.agent_args.get("lr", 0.0003)
+        clip_epsilon = self.agent_args.get("clip_epsilon", 0.2)
+        group_size = self.agent_args.get("group_size", 5)
+        kl_weight = self.agent_args.get("kl_weight", 0.1)
+        
+        agent = GRPOAgent(state_dim, action_dim, hidden_sizes, action_space, 
+                         lr=lr, clip_epsilon=clip_epsilon, group_size=group_size, kl_weight=kl_weight)
+
+        while True:
+            # 1. 최신 정책 확인 및 업데이트
+            if not self.policy_queue.empty():
+                new_policy_state_dict = self.policy_queue.get()
+                agent.old_policy.load_state_dict(new_policy_state_dict)
+                # 샘플링용 정책도 업데이트
+                agent.policy.load_state_dict(new_policy_state_dict)
+
+            # 2. 전체 trajectory 수집
+            states, actions, log_probs, rewards = [], [], [], []
+            state = env.reset()
+            done = False
+            steps = 0
+            
+            while not done and steps < self.max_steps:
+                action, log_prob = agent.select_action(state, evaluate=False)
+                next_state, reward, done = env.step(action)
+
+                states.append(state)
+                actions.append(action)
+                log_probs.append(log_prob)
+                rewards.append(reward)
+
+                state = next_state
+                steps += 1
+
+            # 3. trajectory를 큐에 추가
+            trajectory = {
+                'states': np.array(states),
+                'actions': np.array(actions),
+                'log_probs': np.array(log_probs),
+                'rewards': np.array(rewards)
+            }
+            
+            episode_reward = sum(rewards)
+            print(f"[TrajectoryCollector {self.collector_id}] Episode finished. Reward: {episode_reward:.2f}, Steps: {steps}")
+            
+            try:
+                self.trajectory_queue.put(trajectory, timeout=1)
+            except:
+                # 큐가 가득 찬 경우 패스
+                pass

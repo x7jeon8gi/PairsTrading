@@ -24,11 +24,11 @@ env_args:
   end_month: '2005-12'
   reward_scale: 1 #* Scale 
   num_inputs: 33
-  hard_reward: 'Sharpe2' # ! Use new DirectSharpe reward function
+  hard_reward: 'Sharpe' # ! Use new DirectSharpe reward function
   dynamic_gamma: 0.01 # ! Set to 0 to provide a clean reward signal
 
 agent_args:
-  agent_type: "SAC"    # Type of agent
+  agent_type: "GRPO"    # Type of agent
   num_inputs: 33 #25-03-11 : State 증가 
   num_action: 2
   action_space: [[0.8, 0.3] , [2.0, 0.7]] # 첫번째 차원(thres) 최소값 0.8, 최대값 2.0 / 두번째 차원(outlier) 최소값 0.3, 최대값 0.7
