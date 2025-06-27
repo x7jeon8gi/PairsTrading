@@ -10,6 +10,154 @@ from datetime import datetime, timedelta
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.trading_logic import calculate_positions, calculate_portfolio_returns, LONG_NAN_RETURN, SHORT_NAN_RETURN
 
+class SharpeOptimReward:
+    """
+    Differential Sharpe Ratio + Tail-risk penalty
+    -------------------------------------------------
+    * decay     : EWMA 감쇠율(λ). 작을수록 긴 히스토리 반영
+    * mdd_alpha : MDD 패널티 계수
+    * cvar_alpha: CVaR(95%) 패널티 계수  
+    * clip      : 보상 클리핑 한계 (|r| <= clip)
+    """
+    def __init__(
+        self,
+        decay: float = 0.02,           # 조금 더 빠른 적응 (기본값보다 높임)
+        reward_scale: float = 1.0,
+        mdd_alpha: float = 3.0,        # MDD 페널티 강화 (위험 회피)
+        cvar_alpha: float = 2.0,       # CVaR 페널티 강화 (꼬리 위험 회피)
+        clip: float = 3.0,             # 클리핑 범위 축소 (안정성 증대)
+        **kwargs
+    ):
+        self.decay = decay
+        self.reward_scale = reward_scale
+        self.mdd_alpha = mdd_alpha
+        self.cvar_alpha = cvar_alpha
+        self.clip = clip
+
+        # EWMA 통계량
+        self.mean_ret = 0.0          # μ_t
+        self.var_ret = 1e-8          # σ_t^2  (초기값=ε)
+        # 에쿼티 커브 및 MDD 계산용
+        self.equity = 1.0
+        self.peak_equity = 1.0
+        self.returns_history = []     # tail-risk 계산용
+
+    def __call__(self, log_earning: float, long_firm_returns=None, short_firm_returns=None) -> float:
+        """
+        log_earning : 다음 스텝 로그 수익률 (ln(1+R_t))
+        ------------------------------------------------------------------
+        보상 = Differential Sharpe Ratio
+             – MDD Penalty
+             – CVaR_95 Penalty
+        """
+        # ---------- 1) EWMA 통계량 업데이트 ----------
+        r_t = log_earning                    # 로그수익률
+        lam = self.decay
+        delta = r_t - self.mean_ret
+        self.mean_ret += lam * delta
+        self.var_ret  += lam * (delta**2 - self.var_ret)
+        sigma = np.sqrt(self.var_ret) + 1e-8
+
+        # ---------- 2) Differential Sharpe (Moody & Saffell, 2001) ----------
+        # ∂Sharpe/∂r_t ≈ (r_t - μ_{t-1}) / σ_{t-1}
+        dsr = delta / sigma
+
+        # ---------- 3) 실시간 MDD 계산 ----------
+        self.equity *= np.exp(r_t)
+        self.peak_equity = max(self.peak_equity, self.equity)
+        drawdown = 1.0 - self.equity / self.peak_equity      # 비율형 DD (0~1)
+        mdd_penalty = self.mdd_alpha * drawdown
+
+        # ---------- 4) Tail-risk(CVaR_95) 페널티 ----------
+        self.returns_history.append(r_t)
+        # 히스토리가 충분할 때만 계산 (30 스텝 이상으로 조정)
+        cvar_penalty = 0.0
+        if len(self.returns_history) >= 30:
+            # 최대 최근 120개월 (10년) 데이터 사용
+            rets = np.array(self.returns_history[-120:])      
+            var95 = np.quantile(rets, 0.05)
+            cvar95 = rets[rets <= var95].mean()               # 평균 손실 (음수값)
+            cvar_penalty = self.cvar_alpha * abs(cvar95)      # 절댓값 → 패널티(+)
+
+        # ---------- 5) 변동성 페널티 (추가적인 안정성) ----------
+        volatility_penalty = 0.5 * sigma  # 변동성이 클수록 페널티
+
+        # ---------- 6) 최종 보상 ----------
+        reward = (
+            self.reward_scale * dsr       # Sharpe Gradient ↑
+            - mdd_penalty                 # DD ↓
+            - cvar_penalty                # Tail-risk ↓
+            - volatility_penalty          # 변동성 ↓
+        )
+
+        # ---------- 7) 안정성 클리핑 ----------
+        reward = np.clip(reward, -self.clip, self.clip)
+        return float(reward)
+
+
+class DirectSharpeReward:
+    """
+    직접적인 Sharpe Ratio 기반 보상 함수
+    -------------------------------------------------
+    전체 기간의 실제 Sharpe Ratio 향상에 집중
+    기존 SharpeOptimReward의 복잡한 패널티 없이 순수 Sharpe 최적화
+    """
+    def __init__(
+        self,
+        reward_scale: float = 10.0,    # 더 큰 스케일로 명확한 신호
+        window_size: int = 24,         # 2년 rolling window
+        min_periods: int = 6,          # 최소 6개월 데이터 필요
+        **kwargs
+    ):
+        self.reward_scale = reward_scale
+        self.window_size = window_size
+        self.min_periods = min_periods
+        
+        # 수익률 히스토리 저장
+        self.returns_history = []
+        self.prev_sharpe = 0.0
+
+    def __call__(self, log_earning: float, long_firm_returns=None, short_firm_returns=None) -> float:
+        """
+        실제 Sharpe Ratio 개선에 기반한 보상
+        """
+        # 현재 수익률 추가
+        self.returns_history.append(log_earning)
+        
+        # Window size 유지 (최근 24개월만 사용)
+        if len(self.returns_history) > self.window_size:
+            self.returns_history.pop(0)
+        
+        # 충분한 데이터가 있을 때만 Sharpe ratio 계산
+        if len(self.returns_history) < self.min_periods:
+            # 초기에는 단순 수익률 기반 보상
+            return self.reward_scale * log_earning
+        
+        # 현재 Sharpe ratio 계산
+        returns_array = np.array(self.returns_history)
+        mean_return = np.mean(returns_array)
+        std_return = np.std(returns_array, ddof=1) + 1e-8  # 표본 표준편차
+        current_sharpe = mean_return / std_return
+        
+        # Sharpe ratio 개선도를 보상으로 사용
+        sharpe_improvement = current_sharpe - self.prev_sharpe
+        
+        # 추가 보너스: 절대적 Sharpe 수준도 고려
+        absolute_sharpe_bonus = max(0, current_sharpe - 1.0) * 0.1  # Sharpe > 1.0일 때 보너스
+        
+        # 최종 보상
+        reward = (
+            self.reward_scale * sharpe_improvement +  # Sharpe 개선도 (핵심)
+            absolute_sharpe_bonus +                   # 절대적 Sharpe 보너스
+            0.1 * log_earning                         # 기본 수익률 (작은 가중치)
+        )
+        
+        # 이전 Sharpe 업데이트
+        self.prev_sharpe = current_sharpe
+        
+        return float(reward)
+
+
 class TradingEnvironment:
     """
     Designed for Soft Actor Critic (SAC) algorithm.
@@ -169,115 +317,206 @@ class TradingEnvironment:
         self.prev_rolling_sharpe = 0.0
         self.prev_drawdown = 0.0
         
+        # 'Sharpe' 보상 함수가 사용될 경우, 계산기를 리셋
+        if self.hard_reward == 'Sharpe':
+            self.sharpe_reward_calculator = SharpeOptimReward(
+                decay=0.02,
+                reward_scale=self.reward_scale,
+                mdd_alpha=3.0,
+                cvar_alpha=2.0,
+                clip=3.0
+            )
+        elif self.hard_reward == 'Sharpe2':
+            self.sharpe_reward_calculator = DirectSharpeReward(
+                reward_scale=10.0,    # 명확한 신호를 위해 큰 스케일
+                window_size=24,       # 2년 rolling window
+                min_periods=6         # 최소 6개월 데이터
+            )
+            
         return self._get_state()
     
+    def _get_current_data(self):
+        """Helper to get current month's data."""
+        current_month = self.cluster_files[self.current_step].split('/')[-1].split('.')[0]
+        cluster_data = self.all_cluster_data[current_month]
+        prob_data = self.all_prob_data.get(current_month) # Use .get for safety
+        
+        # Determine next month for returns data
+        current_date = datetime.strptime(current_month, '%Y-%m')
+        next_month_date = current_date.replace(year=current_date.year + (current_date.month == 12), 
+                                               month=(current_date.month % 12) + 1)
+        next_month_str = next_month_date.strftime('%Y-%m')
+        
+        next_month_returns = self.returns_data.get(next_month_str)
+
+        return current_month, cluster_data, prob_data, next_month_str, next_month_returns
+
     def _get_state(self):
         """
-        STATE 정의:
-        1. Number of assets (from current cluster file)
-        2. S&P500 monthly return
-        3. S&P500 monthly volatility
-        4. Average momentum log return
-        5. Top 25% quantile of momentum log returns
-        6. Bottom 25% quantile of momentum log returns
-        7. Momentum volatility (standard deviation)
-        8. Current portfolio drawdown
+        Constructs the state vector for the RL agent.
+
+        The state includes market-wide data, cluster-specific metrics, 
+        and historical performance indicators.
         """
-
-        # # Load current and next month's data
-        # current_cluster = self.cluster_files[self.current_step] # 현재 달의 클러스터링 결과  예: "data/2001-01.csv"
-        # self.current_month = current_cluster.split('/')[-1].split('.')[0]  # e.g., '2001-01'
-        # current_data = pd.read_csv(current_cluster, index_col=0) # 현재 달의 클러스터링 결과 불러오기
-
-        # self.current_data = current_data.sort_values(by='MOM1', ascending=False) # Sort by momentum
-        # self.next_month = self.cluster_files[self.current_step + 1].split('/')[-1].split('.')[0] # 다음달
+        # --- 1. 현재 월 데이터 가져오기 ---
+        self.current_month, self.current_data, self.prob_data, self.next_month, self.next_month_returns = self._get_current_data()
         
-        # Load current and next month's data
-        current_cluster = self.cluster_files[self.current_step]
-        self.current_month = current_cluster.split('/')[-1].split('.')[0] 
-        self.current_data = self.all_cluster_data[self.current_month]
-        self.current_data = self.current_data.sort_values(by='MOM1', ascending=False)
-        if self.current_step + 1 < len(self.cluster_files):
-            self.next_month = self.cluster_files[self.current_step + 1].split('/')[-1].split('.')[0]
+        if self.next_month_returns is None:
+            # 다음 달 수익률 데이터가 없으면 종료
+            return np.zeros(self.num_inputs, dtype=np.float32)
 
-        #* Extract S&P500 data
-        sp500 = self.index_data.loc[self.current_month]
-        num_assets = sp500['Number of Assets']
-        sp_return = sp500['Monthly Returns']
-        sp_volatility = sp500['Monthly Volatility']
+        # --- 2. 풍부한 Pairs Trading 특화 State 벡터 구성 ---
+        state = []
         
-        #* Convert to log returns for each asset & Calculate individual asset information
-        log_returns = np.log1p(self.current_data['MOM1'])  # np.log1p(x) is equivalent to log(1 + x)
-        avg_asset_return = log_returns.mean()
-        top_asset_return = log_returns.quantile(0.75)  # Top 25% quantile of log returns
-        bottom_asset_return = log_returns.quantile(0.25)  # Bottom 25% quantile of log returns
-        volatility = log_returns.std()
-
-        #* Cluster statistics
-        clusters = self.current_data['clusters']
-        total_firms = len(clusters)
-        cluster_counts = clusters.value_counts()
-        n_clusters = len(cluster_counts)
-        max_cluster_ratio = cluster_counts.max() / total_firms if total_firms > 0 else 0
-        cluster_ratios = cluster_counts / total_firms if total_firms > 0 else pd.Series(dtype=float)
-        entropy = - (cluster_ratios * np.log(cluster_ratios + 1e-8)).sum()
-
-        n_clusters_norm = n_clusters / 50.0         # 예: 최대 클러스터 수를 50으로 가정
-        entropy_norm = entropy / 50                # 예: 최대 엔트로피를 5 정도로 가정
-
-        #* Portfolio State Information
-        # Calculate current positions based on last action (need to store this or recalculate)
-        # For simplicity, let's assume we can recalculate or store from _take_action
-        # Placeholder: Need to access/recalculate long_firms and short_firms count for the *current* step
-        # This might require restructuring how state is obtained relative to action execution.
-        # As a temporary proxy, let's use portfolio value and drawdown.
-
-        #* Temporal Features (Example: Rolling Portfolio Volatility)
-        # self.rolling_returns 리스트 관리 (매 step 마다 log_earning 추가/오래된 값 제거)
-        if len(self.rolling_returns) > self.window_size:
-             self.rolling_returns.pop(0)
-        if len(self.rolling_returns) > 1:
-            self.rolling_volatility = np.std(self.rolling_returns)
+        # === 2-1. 시장 환경 정보 ===
+        # S&P 500 수익률 (시장 방향성)
+        if self.next_month in self.index_data.index:
+            sp500_return = self.index_data.loc[self.next_month, 'Monthly Returns'] 
         else:
-            self.rolling_volatility = 0.0 # 초기에는 변동성 0
+            sp500_return = 0.0
+        state.append(sp500_return)
+        
+        # 시장 변동성 (최근 6개월 S&P 500 변동성)
+        sp500_volatility = 0.0
+        if hasattr(self, 'index_data') and len(self.rolling_returns) > 1:
+            # SP500 과거 데이터로 변동성 추정
+            past_months = [self.cluster_files[max(0, self.current_step - i)].split('/')[-1].split('.')[0] 
+                          for i in range(min(6, self.current_step + 1))]
+            sp500_returns = [self.index_data.loc[month, 'Monthly Returns'] 
+                           for month in past_months]
+            sp500_volatility = np.std(sp500_returns) if len(sp500_returns) > 1 else 0.0
+        state.append(sp500_volatility)
+        
+        # === 2-2. 포트폴리오 성과 지표 ===
+        state.append(self.current_portfolio_value)  # 누적 로그 수익률
+        state.append(self.max_portfolio_value - self.current_portfolio_value)  # Drawdown
+        
+        # 최근 성과 추세 (3개월, 6개월 Rolling Sharpe)
+        if len(self.rolling_returns) >= 3:
+            recent_3m = self.rolling_returns[-3:]
+            sharpe_3m = np.mean(recent_3m) / (np.std(recent_3m) + 1e-8)
+            state.append(sharpe_3m)
+        else:
+            state.append(0.0)
+            
+        if len(self.rolling_returns) >= 6:
+            recent_6m = self.rolling_returns[-6:]
+            sharpe_6m = np.mean(recent_6m) / (np.std(recent_6m) + 1e-8)
+            state.append(sharpe_6m)
+        else:
+            state.append(0.0)
+            
+        # === 2-3. 클러스터 & Spread 품질 지표 ===
+        if self.current_data is not None and len(self.current_data) > 0:
+            # 현재 데이터에 spread가 없다면 계산
+            current_data_with_spread = self.current_data.copy()
+            if 'spread' not in current_data_with_spread.columns:
+                # Spread 계산 (trading_logic와 동일한 방식)
+                def compute_spread(group):
+                    sorted_desc = group.sort_values(ascending=False).values
+                    sorted_asc = group.sort_values(ascending=True).values
+                    return sorted_desc - sorted_asc
+                
+                if 'clusters' in current_data_with_spread.columns and 'MOM1' in current_data_with_spread.columns:
+                    current_data_with_spread['spread'] = current_data_with_spread.groupby('clusters')['MOM1'].transform(compute_spread)
+            
+            # 기본 spread 통계량
+            spread_data = current_data_with_spread['spread'] if 'spread' in current_data_with_spread.columns else pd.Series()
+            if not spread_data.empty:
+                state.append(spread_data.mean())     # 평균 spread
+                state.append(spread_data.std())      # spread 변동성
+                state.append(spread_data.median())   # 중위값 (outlier 영향 적음)
+                state.append(spread_data.quantile(0.25))  # 1사분위수
+                state.append(spread_data.quantile(0.75))  # 3사분위수
+                state.append((spread_data > 0).mean())    # Positive spread 비율
+            else:
+                state.extend([0.0] * 6)
+                
+            # 클러스터 다양성 지표
+            clusters = current_data_with_spread['clusters'] if 'clusters' in current_data_with_spread.columns else pd.Series()
+            if not clusters.empty:
+                num_clusters = clusters.nunique()
+                avg_cluster_size = len(clusters) / max(num_clusters, 1)
+                largest_cluster_ratio = clusters.value_counts().iloc[0] / len(clusters) if len(clusters) > 0 else 0
+                state.extend([num_clusters, avg_cluster_size, largest_cluster_ratio])
+            else:
+                state.extend([0.0, 0.0, 0.0])
+                
+            # Momentum 분포 정보
+            mom1_data = current_data_with_spread['MOM1'] if 'MOM1' in current_data_with_spread.columns else pd.Series()
+            if not mom1_data.empty:
+                state.append(mom1_data.mean())       # 평균 momentum
+                state.append(mom1_data.std())        # momentum 분산
+                state.append(mom1_data.skew())       # 비대칭성 (왜도)
+                state.append((mom1_data > 0).mean()) # Positive momentum 비율
+            else:
+                state.extend([0.0] * 4)
+        else:
+            state.extend([0.0] * 13)
+            
+        # === 2-4. 확률 데이터 품질 ===
+        if self.prob_data is not None and len(self.prob_data) > 0:
+            max_probs = self.prob_data.max(axis=1)
+            state.append(max_probs.mean())           # 평균 최대 확률
+            state.append(max_probs.std())            # 확률 분산
+            state.append((max_probs > 0.5).mean())   # 고신뢰도 예측 비율
+            
+            # 클러스터 예측 분포
+            prob_entropy = -np.sum(self.prob_data * np.log(self.prob_data + 1e-8), axis=1).mean()
+            state.append(prob_entropy)               # 평균 엔트로피 (불확실성)
+        else:
+            state.extend([0.0] * 4)
+            
+        # === 2-5. 포지션 & 리스크 관리 ===
+        # 이전 포지션 정보
+        prev_long = getattr(self, 'num_long_positions_prev', 0)
+        prev_short = getattr(self, 'num_short_positions_prev', 0)
+        total_prev_positions = prev_long + prev_short
+        
+        state.append(prev_long)
+        state.append(prev_short)
+        state.append(total_prev_positions)
+        state.append(prev_long / max(total_prev_positions, 1))  # Long ratio
+        
+        # 과거 승률 (최근 10스텝)
+        if len(self.rolling_returns) > 0:
+            recent_returns = self.rolling_returns[-10:]
+            win_rate = (np.array(recent_returns) > 0).mean()
+            state.append(win_rate)
+            
+            # 연속 승/패 횟수
+            consecutive_wins = 0
+            consecutive_losses = 0
+            for ret in reversed(recent_returns):
+                if ret > 0:
+                    consecutive_wins += 1
+                    break
+                else:
+                    consecutive_losses += 1
+            state.append(consecutive_wins)
+            state.append(consecutive_losses)
+        else:
+            state.extend([0.0, 0.0, 0.0])
+            
+        # === 2-6. 시간 & 계절성 정보 ===
+        # 월별 인덱스 (1-12)
+        current_month_num = int(self.current_month.split('-')[1])
+        state.append(current_month_num / 12.0)  # 정규화
+        
+        # 분기 정보 (1-4)
+        quarter = (current_month_num - 1) // 3 + 1
+        state.append(quarter / 4.0)
+        
+        # 상대적 진행도 (에피소드 내 위치)
+        progress = self.current_step / max(len(self.cluster_files) - 1, 1)
+        state.append(progress)
+        
+        # State 벡터 크기 맞추기
+        while len(state) < self.num_inputs:
+            state.append(0.0)
+        
+        return np.array(state[:self.num_inputs], dtype=np.float32)
 
-        # 이전 스텝의 포지션 정보 사용
-        num_long_positions = getattr(self, 'num_long_positions_prev', 0)
-        num_short_positions = getattr(self, 'num_short_positions_prev', 0)
-        long_ratio = num_long_positions / total_firms if total_firms > 0 else 0
-        short_ratio = num_short_positions / total_firms if total_firms > 0 else 0
-        self.current_drawdown = self.max_portfolio_value - self.current_portfolio_value
-
-        # Assemble the state vector
-        state_vector = np.array([
-            # Market Info
-            num_assets,
-            sp_return,
-            sp_volatility,
-            # Momentum Info
-            avg_asset_return,
-            top_asset_return,
-            bottom_asset_return,
-            volatility,
-            # Cluster Info
-            n_clusters_norm,
-            max_cluster_ratio,
-            entropy_norm,
-            # Portfolio Info (Placeholders/Simplified)
-            #long_ratio, # Requires knowing positions *before* get_state is called for next step
-            #self.current_portfolio_value, # Might need normalization
-            self.current_drawdown, # Might need normalization
-            #self.rolling_volatility
-        ], dtype=np.float32)
-
-        # Fill NaNs just in case any calculation resulted in NaN
-        state_vector = np.nan_to_num(state_vector, nan=0.0) # Replace NaN with 0
-
-        # Debugging: Check if state_vector contains NaN values (should be handled by nan_to_num)
-        # if np.any(np.isnan(state_vector)):
-        #     print("Warning: state_vector contains NaN values after nan_to_num:", state_vector)
-
-        return state_vector
 
     def _take_action(self, action, stoploss=0.3):
         """
@@ -290,9 +529,12 @@ class TradingEnvironment:
         current_month = self.prob_files[self.current_step].split('/')[-1].split('.')[0]
         prob_data = self.all_prob_data[current_month]
         
-        # cluster_data 변수명을 current_data로 변경하여 사용
-        cluster_data = self.current_data
-        cluster_data.reset_index(inplace=True)
+        # cluster_data 변수명을 current_data로 변경하여 사용 (copy해서 안전하게 사용)
+        cluster_data = self.current_data.copy()
+        
+        # 안전하게 인덱스 리셋 (firms 컬럼이 없을 때만 인덱스를 컬럼으로 변환)
+        if 'firms' not in cluster_data.columns:
+            cluster_data = cluster_data.reset_index(drop=False)
         
         # 공통 트레이딩 로직 사용: 롱/숏 포지션 계산
         long_firms, short_firms, cluster_data_with_spread = calculate_positions(
@@ -412,16 +654,33 @@ class TradingEnvironment:
                 cvar_penalty = abs(cvar)
                 base_reward = (log_earning - self.lambda_cvar * cvar_penalty) * self.reward_scale
         
-        # Sharpe ratio
+        # Sharpe ratio - 기존 Differential Sharpe Ratio 사용
         elif self.hard_reward == 'Sharpe':
-            all_returns = pd.concat([long_firm_returns, short_firm_returns])
-            if all_returns.empty:
-                base_reward = 0.0
-            else:
-                avg_return = all_returns.mean()
-                volatility = all_returns.std()
-                sharpe = avg_return / (volatility + 1e-1)
-                base_reward = sharpe * self.reward_scale
+            # SharpeOptimReward 계산기가 초기화되어 있는지 확인
+            if not hasattr(self, 'sharpe_reward_calculator'):
+                self.sharpe_reward_calculator = SharpeOptimReward(
+                    decay=0.02,
+                    reward_scale=self.reward_scale,
+                    mdd_alpha=3.0,
+                    cvar_alpha=2.0,
+                    clip=3.0
+                )
+            
+            # 기존 SharpeOptimReward 클래스 사용
+            base_reward = self.sharpe_reward_calculator(log_earning, long_firm_returns, short_firm_returns)
+        
+        # Sharpe2 ratio - 새로운 Direct Sharpe Ratio 사용
+        elif self.hard_reward == 'Sharpe2':
+            # DirectSharpeReward 계산기가 초기화되어 있는지 확인
+            if not hasattr(self, 'sharpe_reward_calculator'):
+                self.sharpe_reward_calculator = DirectSharpeReward(
+                    reward_scale=10.0,    # 명확한 신호를 위해 큰 스케일
+                    window_size=24,       # 2년 rolling window
+                    min_periods=6         # 최소 6개월 데이터
+                )
+            
+            # 새로운 DirectSharpeReward 클래스 사용
+            base_reward = self.sharpe_reward_calculator(log_earning, long_firm_returns, short_firm_returns)
         
         elif self.hard_reward == 'ReturnVolatilityDrawdown':
             # Hyperparameters to balance return, volatility, and drawdown
@@ -524,13 +783,14 @@ class TradingEnvironment:
                 base_reward = 0.0
             
             # drawdown 패널티 추가
-            if self.current_drawdown > 0:
-                drawdown_penalty = self.current_drawdown * 0.1 # * self.drawdown_scale
+            current_drawdown = self.max_portfolio_value - self.current_portfolio_value
+            if current_drawdown > 0:
+                drawdown_penalty = current_drawdown * 0.1
                 base_reward -= drawdown_penalty
 
         # Default: simple scaled log return
         else:
-            base_reward = 0
+            base_reward = log_earning * self.reward_scale
 
         # Dynamic bonus: incorporate change in portfolio value relative to the previous step
         gamma_dynamic = self.dynamic_gamma

@@ -19,13 +19,22 @@ import json
 import time
 from grpo import GRPOAgent
 from ppo import PPOAgent
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-sys.path.append(parent_dir)
 from utils.seed import seed_everything
 from utils import calculate_metrics
 from utils.metrics import calculate_financial_metrics_monthly
 import logging
+from collector import DataCollector
+import torch.multiprocessing as mp
+
+# Set the start method for multiprocessing
+# This must be done at the very beginning, right after imports
+# and before any other multiprocessing-related code is executed.
+if __name__ == "__main__":
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        pass
+
 
 def override_config(config, args):
     args_dict = vars(args)
@@ -79,8 +88,9 @@ class Trainer(object):
                  use_per=False,
                  per_alpha=0.6,
                  per_beta=0.4,
-                 eval_interval=100,
-                 eval_episodes=10):
+                 eval_interval=10,
+                 eval_episodes=10,
+                 num_collectors=2):
 
         #wandb.init(project='SAC_PairsTrading', name=save_name, config=config)
 
@@ -100,11 +110,12 @@ class Trainer(object):
         self.per_alpha = per_alpha
         self.per_beta = per_beta
         self.logger = logger
+        self.num_collectors = num_collectors
 
-        # ! 환경 초기화
-        self.env    = TradingEnvironment(**env_args)
+        # ! 환경 초기화 -> Collector로 이동
+        # self.env    = TradingEnvironment(**env_args)
 
-        # ! 에이전트 초기화
+        # ! 에이전트 초기화 (Learner)
         agent_type = agent_args.get("agent_type", "SAC")
         if agent_type == "SAC":
             from sac import SAC
@@ -137,85 +148,108 @@ class Trainer(object):
         if self.use_per:
             from replay_memory import PrioritizedReplayMemory
             self.memory = PrioritizedReplayMemory(replay_size, seed, alpha=per_alpha, beta=per_beta)
-            self.logger.info("Using Prioritized Experience Replay")
+            self.logger.info(f"🔥 Using Prioritized Experience Replay (alpha={per_alpha}, beta={per_beta})")
+            print(f"🔥 PER ENABLED: Memory type = {type(self.memory).__name__}")
         else:
             from replay_memory import ReplayMemory
             self.memory = ReplayMemory(replay_size, seed)
-            self.logger.info("Using standard Replay Memory")
+            self.logger.info("📝 Using standard Replay Memory")
+            print(f"📝 STANDARD MEMORY: Memory type = {type(self.memory).__name__}")
             
-        self.max_reward = -float('inf')
+        self.max_avg_reward = -float('inf')
 
         # Create model directory if it doesn't exist
         os.makedirs('./res/RL/models', exist_ok=True)
         os.makedirs('./res/RL/rewards', exist_ok=True)
+        
+        # --- 비동기 파이프라인 설정 ---
+        self.experience_queue = mp.Queue(maxsize=1000)
+        self.policy_queue = mp.Queue(maxsize=self.num_collectors)
+
+        self.collectors = []
+        for i in range(self.num_collectors):
+            collector_seed = self.seed + i
+            collector = DataCollector(
+                self.env_args,
+                self.agent_args,
+                self.experience_queue,
+                self.policy_queue,
+                collector_seed,
+                collector_id=i
+            )
+            collector.start()
+            self.collectors.append(collector)
+            self.logger.info(f"DataCollector {i} started with seed {collector_seed}.")
+
 
     def train_offline(self):
-        """Offline training loop for SAC (replay memory based)"""
+        """Offline training loop for SAC (replay memory based) using async data collection."""
         total_numsteps = 0
         updates = 0
         rewards = []
         progress_bar = tqdm(total=self.n_steps, desc="Training Progress")
-        random_actions = np.zeros((2,), dtype=np.float32)
 
-        for i_episode in itertools.count(1):
-            episode_start_time = time.time()
-            episode_reward = 0
-            done = False
-            state = self.env.reset()
+        # 초기 정책을 Collector들에게 한 번 브로드캐스트
+        policy_state_dict = {k: v.cpu() for k, v in self.agent.actor.state_dict().items()}
+        for _ in range(self.num_collectors):
+            self.policy_queue.put(policy_state_dict)
 
-            while not done:
-                if total_numsteps < self.start_steps:
-                    random_actions[0] = np.random.uniform(0, 2.0)
-                    random_actions[1] = np.random.uniform(0.0, 0.7)
-                    action = random_actions
-                else: # start_steps 이후 본격적으로 에이전트 행동 시작 
-                    with torch.no_grad(): 
-                        action_result = self.agent.select_action(state, evaluate=False)  # sample action from policy
-                        if isinstance(action_result, tuple):
-                            action = action_result[0]  # 튜플의 첫 번째 요소가 action
-                        else:
-                            action = action_result
-
-                if len(self.memory) > self.batch_size:
-                    for _ in range(self.update_per_step):
-                        critic_1_loss, critic_2_loss, policy_loss, alpha_loss = self.agent.update_parameters(self.memory, self.batch_size, updates)
-                        updates += 1
-
-                        if updates % 10000 == 0:
-                            log_msg = (f"Updates: {updates} | C1 Loss: {critic_1_loss:.4f} | "
-                                       f"C2 Loss: {critic_2_loss:.4f} | Policy Loss: {policy_loss:.4f} | "
-                                       f"Alpha Loss: {alpha_loss:.4f} | Alpha: {self.agent.alpha.item():.4f}")
-                            self.logger.info(log_msg)
-
-                next_state, reward, done = self.env.step(action, logging=False)
-                total_numsteps += 1
-                episode_reward += reward
-
+        while updates < self.n_steps:
+            # 1. 경험 데이터 수집 및 리플레이 버퍼 채우기
+            try:
+                state, action, reward, next_state, done = self.experience_queue.get(timeout=1)
                 self.memory.push(state, action, reward, next_state, done)
-                state = next_state
-
+                total_numsteps += 1
                 progress_bar.update(1)
-                if total_numsteps >= self.n_steps:
-                    done = True
+            except Exception as e:
+                # 큐가 비어있으면 계속 학습 진행
+                pass
 
-            self.logger.info(f'Episode: {i_episode} | Total Steps: {total_numsteps} | Episode Reward: {episode_reward:.4f}')
+            # 2. 리플레이 버퍼가 충분히 차면 학습 시작
+            if len(self.memory) > self.batch_size:
+                for _ in range(self.update_per_step):
+                    critic_1_loss, critic_2_loss, policy_loss, alpha_loss = self.agent.update_parameters(self.memory, self.batch_size, updates)
+                    updates += 1
 
-            if episode_reward > self.max_reward:
-                self.max_reward = episode_reward
-                self.agent.save_model('./res/RL/models', self.save_name)
-                self.logger.info(f'********** New best model saved with reward: {self.max_reward:.4f} **********')
+                    # 주기적으로 Collector들에게 최신 정책 전송
+                    if updates % 200 == 0: 
+                        policy_state_dict = {k: v.cpu() for k, v in self.agent.actor.state_dict().items()}
+                        # 큐가 비어있을 때만 넣어서 너무 많이 쌓이지 않도록 함
+                        if self.policy_queue.empty():
+                            for _ in range(self.num_collectors):
+                                self.policy_queue.put(policy_state_dict)
 
-            if i_episode % self.eval_interval == 0:
+                    if updates % 1000 == 0:  # 1000번마다 출력으로 변경
+                        log_msg = (f"Updates: {updates} | C1 Loss: {critic_1_loss:.4f} | "
+                                   f"C2 Loss: {critic_2_loss:.4f} | Policy Loss: {policy_loss:.4f} | "
+                                   f"Alpha Loss: {alpha_loss:.4f} | Alpha: {self.agent.alpha.item():.4f}")
+                        self.logger.info(log_msg)
+                        print(f"📈 Training Progress - Updates: {updates} | C1: {critic_1_loss:.2f} | C2: {critic_2_loss:.2f} | Policy: {policy_loss:.2f}")
+
+            # 3. 주기적인 평가
+            if updates > 0 and updates % self.eval_interval == 0: # 수정: 1000 곱하기 제거
                 avg_reward = self._evaluate_agent(self.eval_episodes)
                 rewards.append(avg_reward)
-                self.logger.info(f'Evaluation at Episode: {i_episode} | Total Steps: {total_numsteps} | Average Reward: {avg_reward:.4f}')
+                self.logger.info(f'Evaluation at Updates: {updates} | Total Steps: {total_numsteps} | Average Reward: {avg_reward:.4f}')
 
-            if total_numsteps >= self.n_steps:
+                if avg_reward > self.max_avg_reward:
+                    self.max_avg_reward = avg_reward
+                    self.agent.save_model('./res/RL/models', self.save_name)
+                    self.logger.info(f'********** New best model saved with avg reward: {self.max_avg_reward:.4f} **********')
+
+            if updates >= self.n_steps:
                 break
 
         progress_bar.close()
-        self._save_reward_plot(rewards)
+        self._save_reward_plot(rewards, xlabel=f'Evaluation (every {self.eval_interval} updates)')
         self.logger.info("Offline training completed.")
+
+        # 학습 종료 후 Collector 프로세스 정리
+        for collector in self.collectors:
+            collector.terminate()
+            collector.join()
+        self.logger.info("All DataCollectors terminated.")
+
 
     def train_online(self):
         """Online training loop for PPO/GRPO (group-based updates)"""
@@ -242,12 +276,18 @@ class Trainer(object):
                 self.logger.info(f'Online Update at Episode: {episode_num} | Loss: {update_loss:.4f}')
                 group_trajectories = []  # reset group
 
-            if episode_reward > self.max_reward:
-                self.max_reward = episode_reward
-                self.agent.save_model('./res/RL/models', self.save_name)
-                self.logger.info(f'********** New best model saved with reward: {self.max_reward:.4f} **********')
-
             self.logger.info(f'Episode: {episode_num} | Total Steps: {total_numsteps} | Episode Reward: {episode_reward:.4f}')
+
+            if episode_num % self.eval_interval == 0:
+                avg_reward = self._evaluate_agent(self.eval_episodes)
+                rewards.append(avg_reward)
+                self.logger.info(f'Evaluation at Episode: {episode_num} | Total Steps: {total_numsteps} | Average Reward: {avg_reward:.4f}')
+
+                if avg_reward > self.max_avg_reward:
+                    self.max_avg_reward = avg_reward
+                    self.agent.save_model('./res/RL/models', self.save_name)
+                    self.logger.info(f'********** New best model saved with avg reward: {self.max_avg_reward:.4f} **********')
+
             progress_bar.update(len(trajectory['states']))
             
             # Break loop if n_steps reached
@@ -273,26 +313,38 @@ class Trainer(object):
 
     @torch.no_grad()
     def _evaluate_agent(self, episodes):
-        """Evaluate the agent's performance without affecting training"""
+        """Evaluate the agent's performance without affecting training - optimized version"""
 
-        avg_reward = 0
+        # 평가용 환경이 없으면 생성, 있으면 재사용
+        if not hasattr(self, 'eval_env'):
+            self.eval_env = TradingEnvironment(**self.env_args)
+        
+        episode_rewards = []
         
         # Use evaluation mode for the agent (no exploration)
-        for _ in range(episodes):
-            state = self.env.reset()
+        for ep in range(episodes):
+            state = self.eval_env.reset()
             episode_reward = 0
             done = False
             
             while not done:
                 action = self.agent.select_action(state, evaluate=True)
-                next_state, reward, done  = self.env.step(action)
+                next_state, reward, done  = self.eval_env.step(action)
                 episode_reward += reward
                 state = next_state
             
-            avg_reward += episode_reward
+            episode_rewards.append(episode_reward)
+            
+            # Early stopping: 충분한 에피소드(최소 10개)를 실행한 후 
+            # 분산이 작으면 조기 종료하여 평가 시간 단축
+            if ep >= 9 and ep % 5 == 4:  # 10, 15, 20, ... 에피소드마다 체크
+                rewards_array = np.array(episode_rewards)
+                std_error = np.std(rewards_array) / np.sqrt(len(rewards_array))
+                if std_error < 0.1:  # 표준 오차가 0.1 미만이면 충분히 안정적
+                    break
     
         # Compute average reward
-        avg_reward /= episodes
+        avg_reward = np.mean(episode_rewards)
         return avg_reward
 
     def _save_reward_plot(self, rewards, xlabel=None):
@@ -572,6 +624,8 @@ if __name__ == "__main__":
                         help='random seed (default: 42)')
     parser.add_argument('--batch_size', type=int, default=1024, metavar='N',
                         help='batch size (default: 256)')
+    parser.add_argument('--num_collectors', type=int, default=4, metavar='N',
+                        help='number of parallel data collectors (default: 4)')
    
 
     # * Arguments
@@ -633,7 +687,10 @@ if __name__ == "__main__":
                     logger=logger,
                     use_per=config.get('use_per', False),
                     per_alpha=config.get('per_alpha', 0.6),
-                    per_beta=config.get('per_beta', 0.4)
+                    per_beta=config.get('per_beta', 0.4),
+                    eval_interval=config.get('eval_interval', 10),  # YAML에서 읽어오기
+                    eval_episodes=config.get('eval_episodes', 10), # YAML에서 읽어오기
+                    num_collectors=config.get('num_collectors', 4)
                     )
     
     trainer.train()

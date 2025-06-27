@@ -74,7 +74,12 @@ class SAC(object):
             next_state_action, next_state_log_pi, _ = self.actor.sample(next_state)
             qf1_next_target, qf2_next_target = self.critic_target(next_state, next_state_action)
             min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-            next_q_value = reward + mask * self.gamma * (min_qf_next_target)
+            
+            # 🔧 Q-value 안정화 (클리핑)
+            min_qf_next_target = torch.clamp(min_qf_next_target, -100.0, 100.0)
+            reward = torch.clamp(reward, -10.0, 10.0)  # Reward clipping
+            
+            next_q_value = reward + mask * self.gamma * min_qf_next_target
         
         # Critics update
         qf1, qf2 = self.critic(state, action)
@@ -94,6 +99,8 @@ class SAC(object):
 
         self.critic_optim.zero_grad()
         critic_loss.backward()
+        # 🔧 Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optim.step()
 
         # Policy update
@@ -106,6 +113,8 @@ class SAC(object):
         
         self.policy_optim.zero_grad()
         policy_loss.backward()
+        # 🔧 Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.policy_optim.step()
 
         # Alpha (Entropy term) update
@@ -113,8 +122,12 @@ class SAC(object):
 
         self.alpha_optim.zero_grad()
         alpha_loss.backward()
+        # 🔧 Gradient clipping for alpha
+        torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
         self.alpha_optim.step()
-        self.alpha = self.log_alpha.exp() # Update alpha
+        
+        # 🔧 Alpha 값 안정화 (너무 큰 값 방지)
+        self.alpha = torch.clamp(self.log_alpha.exp(), min=1e-8, max=100.0)
 
         # update target networks
         if updates % self.target_update_interval == 0:

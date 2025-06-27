@@ -1,8 +1,8 @@
 batch_size: 1024
 start_steps: 3000
-n_steps: 100001
+n_steps: 1000001
 num_cluster: 40  # ! Num_clusters
-save_name: '0.0001_exp2' #! Name of the model
+save_name: '0.01_exp4' #! Name of the model
 seed: 42
 replay_size: 1000000 
 update_per_step: 1
@@ -12,6 +12,10 @@ use_per: True # ! Whether to use Prioritized Experience Replay
 per_alpha: 0.6
 per_beta: 0.4
 
+# Evaluation interval (in number of updates)
+eval_interval: 10000  # 1만 업데이트마다 평가 (훨씬 덜 자주)
+eval_episodes: 20     # 20개 에피소드로 빠르게
+
 env_args:
   returns_data: './data/log_returns_by_month.pkl'
   use_winsorize: False
@@ -19,18 +23,18 @@ env_args:
   start_month: '1995-01'
   end_month: '2005-12'
   reward_scale: 1 #* Scale 
-  num_inputs: 11
-  hard_reward: 'Sortino' # ! Use Sortino reward function
-  dynamic_gamma: 0.0001 # ! Set to 0 to provide a clean reward signal
+  num_inputs: 33
+  hard_reward: 'Sharpe2' # ! Use new DirectSharpe reward function
+  dynamic_gamma: 0.01 # ! Set to 0 to provide a clean reward signal
 
 agent_args:
   agent_type: "SAC"    # Type of agent
-  num_inputs: 11 #25-03-11 : State 증가 
+  num_inputs: 33 #25-03-11 : State 증가 
   num_action: 2
-  action_space: [[0.0, 0.0] , [2.5, 0.8]] # 첫번째 차원(thres) 최소값 0.0, 최대값 2.5 / 두번째 차원(outlier) 최소값 0.25, 최대값 0.75
+  action_space: [[0.8, 0.3] , [2.0, 0.7]] # 첫번째 차원(thres) 최소값 0.8, 최대값 2.0 / 두번째 차원(outlier) 최소값 0.3, 최대값 0.7
   gamma: 0.99
   tau: 0.005
-  lr: 0.003
+  lr: 0.0003  # 학습률을 1/10로 줄여서 안정화
   kl_weight : 0 
   alpha: 0.2
   group_size: 8 # ! group size
